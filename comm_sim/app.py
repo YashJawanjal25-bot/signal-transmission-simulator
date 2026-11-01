@@ -1,0 +1,3814 @@
+from __future__ import annotations
+
+import streamlit as st
+import numpy as np
+import plotly.graph_objects as go
+import pandas as pd
+from pathlib import Path
+import base64
+
+from utils import SimParams, SimResult, bits_from_string, bits_to_string, gen_random_bits, bits_to_step
+from d2d import simulate_d2d
+from d2a import simulate_d2a, QPSK_MAP, QAM16_AXIS_MAP
+from a2d import simulate_a2d
+from a2a import simulate_a2a
+
+st.set_page_config(
+    page_title="Transmission Simulator",
+    page_icon="🛰️",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+        [data-testid="InputInstructions"] {
+            display: none !important;
+        }
+
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+        }
+
+        section[data-testid="stMain"] > div[data-testid="stMainBlockContainer"]{
+            padding-top: 2.4rem !important;
+            padding-left: 3rem !important;
+            padding-right: 3rem !important;
+            padding-bottom: 2.4rem !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def plot_signal(t, x, title, grid=False, step=False, x_dtick=1, y_dtick=1):
+    fig = go.Figure()
+    if step:
+        fig.add_trace(go.Scatter(x=t, y=x, mode="lines", line_shape="hv", name=title))
+    else:
+        fig.add_trace(go.Scatter(x=t, y=x, mode="lines", name=title))
+    fig.update_layout(title=title, xaxis_title="Time (s)", yaxis_title="Amplitude")
+    if grid:
+        fig.update_xaxes(showgrid=True, tickmode="linear", dtick=x_dtick)
+        fig.update_yaxes(showgrid=True, tickmode="linear", dtick=y_dtick)
+
+    return fig
+
+logo_path = Path(__file__).parent / "assets" / "itu-logo.png"
+
+col_logo, col_text, col_ref = st.columns([1, 7, 4], vertical_alignment="center")
+
+
+
+
+st.title("Encoding and Modulation Techniques Simulator")
+
+with st.sidebar:
+    st.header("Controls")
+
+    mode = st.selectbox(
+        "Mode",
+        ["Digital → Digital", "Digital → Analog", "Analog → Digital", "Analog → Analog"],
+    )
+
+    show_grid = st.checkbox("Show grid", value=True)
+
+    st.divider()
+
+    # -------------------------
+    # Common params (mode-aware)
+    # -------------------------
+    if mode != "Analog → Analog":
+        st.subheader("Common parameters")
+
+        # Always meaningful (Digital sampling / time base)
+        Ns = st.slider("Samples per bit (Ns)", 20, 400, 100, step=10)
+        Tb = st.number_input("Bit duration Tb (s)", min_value=0.001, value=1.0, step=0.1)
+
+        # Derived sampling rate
+        fs = Ns / Tb
+        st.text_input(
+            "Sampling frequency\nfs = Ns / Tb  (Hz)",
+            value=f"{fs:.6g}",
+            disabled=True,
+        )
+
+        # Carrier controls only for Digital → Analog
+        # (Keep hidden defaults for other modes so SimParams stays valid everywhere)
+        Ac_default = 1.0
+        cycles_default = 10
+
+        if mode == "Digital → Analog":
+            st.divider()
+            st.subheader("Carrier parameters")
+
+            Ac = st.number_input("Carrier amplitude Ac", min_value=0.1, value=1.0, step=0.1)
+            cycles_per_bit = st.slider("Carrier cycles per bit", 2, 30, 10)
+        else:
+            Ac = Ac_default
+            cycles_per_bit = cycles_default
+
+        fc = float(cycles_per_bit) / float(Tb)
+
+        # Show fc only when it matters (Digital → Analog)
+        if mode == "Digital → Analog":
+            st.text_input(
+                "Carrier frequency\nfc = cycles_per_bit / Tb  (Hz)",
+                value=f"{fc:.6g}",
+                disabled=True,
+            )
+
+        params = SimParams(fs=fs, Tb=Tb, samples_per_bit=Ns, Ac=Ac, fc=fc)
+
+
+        st.divider()
+
+def summary_block(meta: dict):
+    keys = ["scheme", "match", "input_len", "pad_info", "fs", "fc", "Tb", "samples_per_bit"]
+
+    rows = []
+    for k in keys:
+        if k not in meta:
+            continue
+        v = meta[k]
+
+        # Fixed formatting
+        if k == "Tb" and isinstance(v, (int, float, np.floating)):
+            v = f"{float(v):.2f}"
+        elif k == "fs" and isinstance(v, (int, float, np.floating)):
+            v = f"{float(v):.4f}"
+        elif k == "fc" and isinstance(v, (int, float, np.floating)):
+            v = f"{float(v):.4f}"
+
+        rows.append({"Field": k, "Value": v})
+
+    if not rows:
+        return
+
+    st.subheader("Summary")
+
+    df = pd.DataFrame(rows)
+    df = df.fillna("").astype(str)
+
+    def _zebra(row):
+        # shade every 2nd row lightly
+        if row.name % 2 == 1:
+            return ["background-color: rgba(128,128,128,0.10)"] * len(row)
+        return [""] * len(row)
+
+    styler = df.style.apply(_zebra, axis=1)
+
+    st.dataframe(
+        styler,
+        hide_index=True,
+        width=700, 
+    )
+
+def dict_to_pretty_table(
+    data: dict,
+    *,
+    width: int = 700,
+    float_formats: dict[str, str] | None = None,
+    default_float_fmt: str | None = None,
+):
+    """
+    Render a dict as a 2-column zebra-striped table (like Summary).
+    Falls back to showing non-scalars as compact strings.
+    """
+    if not isinstance(data, dict) or not data:
+        st.info("No data.")
+        return
+
+    rows = []
+
+    def _fmt_scalar(key: str, val):
+        # ints -> clean int
+        if isinstance(val, (np.integer, int)):
+            return str(int(val))
+
+        # floats -> formatted string
+        if isinstance(val, (np.floating, float)):
+            xf = float(val)
+            if not np.isfinite(xf):
+                return str(xf)
+
+            spec = None
+            if isinstance(float_formats, dict) and key in float_formats:
+                spec = float_formats[key]
+            elif default_float_fmt is not None:
+                spec = default_float_fmt
+
+            if spec is None:
+                return xf  # keep raw numeric
+
+            s = format(xf, spec)
+            # trim trailing zeros for fixed-point formats
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s
+
+        if val is None:
+            return ""
+        return str(val)
+
+    for k, v in data.items():
+        key = str(k)
+        if isinstance(v, (str, int, float, bool, type(None), np.floating, np.integer)):
+            rows.append({"Field": key, "Value": _fmt_scalar(key, v)})
+        else:
+            rows.append({"Field": key, "Value": str(v)})
+
+    df = pd.DataFrame(rows)
+
+    def _zebra(row):
+        if row.name % 2 == 1:
+            return ["background-color: rgba(128,128,128,0.10)"] * len(row)
+        return [""] * len(row)
+
+    styler = df.style.apply(_zebra, axis=1)
+
+    st.dataframe(
+        styler,
+        hide_index=True,
+        width=width,
+    )
+
+def render_events_table(events: list, *, width: int = 850):
+    """Render a list[dict] as a zebra-striped table."""
+    if not isinstance(events, list) or len(events) == 0:
+        st.info("No events.")
+        return
+
+    # Make values readable (lists -> short strings)
+    rows = []
+    for e in events:
+        if not isinstance(e, dict):
+            rows.append({"event": str(e)})
+            continue
+        def _fmt_num(x):
+            # Always return a STRING so Streamlit aligns everything the same way
+            if isinstance(x, (np.integer, int)):
+                return str(int(x))
+
+            if isinstance(x, (np.floating, float)):
+                xf = float(x)
+                if np.isfinite(xf) and abs(xf - round(xf)) < 1e-9:
+                    return str(int(round(xf)))
+                return f"{xf:.4f}".rstrip("0").rstrip(".")
+
+            if x is None:
+                return ""
+
+            return str(x)
+
+        r = {}
+        for k, v in e.items():
+            if isinstance(v, list):
+                # Format numeric lists nicely (patterns/chunks/windows)
+                r[k] = "[" + ", ".join(str(_fmt_num(x)) for x in v) + "]"
+            else:
+                r[k] = _fmt_num(v)
+        rows.append(r)
+
+    df = pd.DataFrame(rows)
+
+    def _zebra(row):
+        if row.name % 2 == 1:
+            return ["background-color: rgba(128,128,128,0.10)"] * len(row)
+        return [""] * len(row)
+
+    styler = (
+        df.style
+          .apply(_zebra, axis=1)
+          .set_properties(**{"text-align": "left"})
+          .set_table_styles([{"selector": "th", "props": [("text-align", "left")]}])
+    )
+
+    st.dataframe(
+        styler,
+        hide_index=True,
+        width=width,
+    )
+
+def render_d2d_theory(
+    *,
+    params: SimParams,
+    line_amp: float,
+    show_grid: bool,
+    # assumptions (same semantics as Waveforms tab)
+    nrzl_prev_level: int,
+    nrzi_start_level: int,
+    manchester_prev_bit: int,
+    diff_start_level: float,
+    last_pulse_init: int,
+    last_zero_pulse_init: int,
+    hdb3_nonzero_since_violation_init: int,
+):
+    """
+    Theory tab for Digital → Digital.
+    Beginner-friendly + aligned with Stallings Ch.5.1 and our d2d.py implementation.
+    """
+
+    st.markdown("## Digital data → Digital signals (Line coding)")
+
+    st.markdown(
+        """
+A **digital signal** is a sequence of discrete voltage levels (pulses).  
+Line coding is the **mapping** from input bits → signal elements (voltage levels).  
+
+In this simulator, each bit occupies **Tb** seconds, and we sample it with **Ns** samples per bit:
+- **Tb** = bit duration (s)
+- **Ns** = samples per bit
+- **fs = Ns / Tb** = sampling frequency (Hz)
+
+At the receiver, decoding is done by sampling each bit interval (typically near the middle) and applying the rule of the scheme.
+        """
+    )
+
+    # --- Quick “book vs our code” mapping table ---
+    st.markdown("### Encoding formats (book definition → our implementation)")
+
+    rows = [
+        {"Scheme": "NRZ-L", "Book rule (Table 5.2)": "0 = high, 1 = low", "Our encoder": "_nrzl_levels(bits): 0→+1, 1→−1", "Our decoder": "mid-sample sign: +→0, −→1"},
+        {"Scheme": "NRZI", "Book rule (Table 5.2)": "1 = transition at beginning, 0 = no transition", "Our encoder": "_nrzi_levels(bits, start_level): if bit=1 flip level", "Our decoder": "compare level to previous (nrzi_start_level)"},
+        {"Scheme": "Bipolar-AMI", "Book rule (Table 5.2)": "0 = no line signal, 1 alternates +/−", "Our encoder": "_ami_levels(bits, last_pulse_init): 1 toggles polarity", "Our decoder": "nonzero→1, zero→0"},
+        {"Scheme": "Pseudoternary", "Book rule (Table 5.2)": "1 = no line signal, 0 alternates +/−", "Our encoder": "_pseudoternary_levels(bits, last_zero_pulse_init): 0 toggles polarity", "Our decoder": "nonzero→0, zero→1"},
+        {"Scheme": "Manchester", "Book rule (Table 5.2)": "mid-bit transition; 1: low→high, 0: high→low", "Our encoder": "_manchester_samples(bits, Ns): 1=[−,+], 0=[+,−]", "Our decoder": "compare first-half mean vs second-half mean"},
+        {"Scheme": "Differential Manchester", "Book rule (Table 5.2)": "mid-bit transition always; 0 has start transition, 1 no start transition", "Our encoder": "_diff_manchester_samples(bits, Ns, start_level)", "Our decoder": "detect start transition vs previous end level"},
+        {"Scheme": "B8ZS (scrambling on AMI)", "Book rule (Table 5.2)": "AMI but 8 zeros replaced using violations", "Our encoder": "_b8zs_scramble_ami(bits, last_pulse_init)", "Our decoder": "_descramble_b8zs(tern, last_pulse_init)"},
+        {"Scheme": "HDB3 (scrambling on AMI)", "Book rule (Table 5.2)": "AMI but 4 zeros replaced using violations, rule depends on parity since last violation", "Our encoder": "_hdb3_scramble_ami(bits, last_pulse_init, nonzero_since_violation_init)", "Our decoder": "_descramble_hdb3(tern, last_nonzero_init=last_pulse_init)"},
+    ]
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Scheme": st.column_config.TextColumn("Scheme", width="small"),
+            "Book rule (Table 5.2)": st.column_config.TextColumn("Book rule", width="large"),
+            "Our encoder": st.column_config.TextColumn("Our encoder", width="large"),
+            "Our decoder": st.column_config.TextColumn("Our decoder", width="large"),
+        },
+    )
+
+    st.markdown("---")
+    st.markdown("## Big picture: what each family is trying to solve")
+
+    st.markdown(
+        """
+When comparing line codes, the usual goals are:
+- **Clocking:** do we get enough transitions to recover timing?
+- **DC component:** does the signal have a nonzero average value?
+- **Bandwidth:** more transitions usually increases high-frequency content.
+- **Error detection:** some formats allow spotting impossible patterns.
+        """
+    )
+
+    st.markdown("### 1) NRZ family (NRZ-L, NRZI)")
+    st.markdown(
+        """
+**NRZ-L:** constant level during the whole bit interval (0→+A, 1→−A).  
+**NRZI:** data is “transition vs no transition” at the start of the bit (1→transition, 0→no transition).  
+NRZI is differential: it’s more robust to polarity inversion because decoding uses transitions.
+        """
+    )
+
+    st.markdown("### 2) Multilevel binary (AMI, Pseudoternary)")
+    st.markdown(
+        """
+**AMI:** 0→0V, 1→±A alternating (removes DC, helps clocking on 1-runs).  
+Weakness: long runs of 0s become flat (clocking problem).  
+**Pseudoternary:** same idea but swaps the meaning (1→0V, 0→±A alternating).
+        """
+    )
+
+    st.markdown("### 3) Biphase (Manchester, Differential Manchester)")
+    st.markdown(
+        """
+**Manchester:** always a mid-bit transition (self-clocking). Direction encodes data (1: low→high, 0: high→low).  
+**Differential Manchester:** always mid-bit transition for clocking, and the *start* transition encodes data (0 has start transition, 1 does not). Differential again.
+        """
+    )
+
+    st.markdown("### 4) Scrambling on AMI (B8ZS, HDB3)")
+    st.markdown(
+        """
+Scrambling is used to fix the **long-0s clocking problem** of AMI without switching to a bandwidth-heavier code like Manchester.
+
+The idea:
+- Keep sending an AMI-like ternary waveform.
+- When a long run of zeros appears, **replace it** with a special pattern that includes **violations**.
+- The receiver recognizes the pattern and restores the original zeros.
+        """
+    )
+
+    # ---------------------------------------------------------------------
+    # B8ZS/HDB3 substitution pattern diagrams + "pattern visualizer" section
+    # ---------------------------------------------------------------------
+    st.markdown("## B8ZS/HDB3 substitution patterns (diagram + visualizer)")
+
+    st.markdown(
+        """
+### Definitions used in the patterns
+- **B** = a normal bipolar pulse (it continues AMI alternation).
+- **V** = a violation pulse (it breaks AMI alternation; same polarity as it “should not be”).
+- For B8ZS the book uses: **000VB0VB** substitution when 8 zeros occur.
+- For HDB3 the substitutions are **000V** or **B00V** depending on parity (even/odd) since last substitution.
+        """
+    )
+
+    def _pol_name(sgn: int) -> str:
+        return "Positive (+A)" if sgn > 0 else "Negative (-A)"
+
+    def _b8zs_pattern(last_pulse: int) -> list[int]:
+        # Book form: 000 V B 0 B V
+        # If last_pulse = +1, then V=+1 (violation), B=-1 (bipolar). -> 0 0 0 + - 0 - +
+        # If last_pulse = -1, then V=-1, B=+1. -> 0 0 0 - + 0 + -
+        V = int(last_pulse)
+        B = -int(last_pulse)
+        return [0, 0, 0, V, B, 0, B, V]
+
+    def _hdb3_patterns(last_pulse: int) -> dict:
+        # HDB3 options:
+        # - odd count since last substitution -> 000V (V has same polarity as last_pulse)
+        # - even count since last substitution -> B00V (B is opposite last_pulse; V has same polarity as B)
+        V_000V = int(last_pulse)
+        B_even = -int(last_pulse)
+        V_even = int(B_even)  # violation relative to AMI alternation
+        return {
+            "odd (000V)": [0, 0, 0, V_000V],
+            "even (B00V)": [B_even, 0, 0, V_even],
+        }
+
+    # Show tables (ternary and scaled)
+    last_p = int(last_pulse_init)
+    amp = float(line_amp)
+
+    b8 = _b8zs_pattern(last_p)
+    hdb = _hdb3_patterns(last_p)
+
+    st.markdown(f"### Pattern tables for the current assumed preceding polarity: **{_pol_name(last_p)}**")
+
+    b8_rows = [{"Index": i, "Symbol": v, "Scaled (×A)": float(v) * amp} for i, v in enumerate(b8)]
+    st.write("**B8ZS**: 8 zeros → `000VB0VB`")
+    st.dataframe(pd.DataFrame(b8_rows), hide_index=True, width="stretch")
+
+    hdb_odd = hdb["odd (000V)"]
+    hdb_even = hdb["even (B00V)"]
+
+    h_rows = []
+    for name, pat in [("HDB3 odd → 000V", hdb_odd), ("HDB3 even → B00V", hdb_even)]:
+        for i, v in enumerate(pat):
+            h_rows.append({"Case": name, "Index": i, "Symbol": v, "Scaled (×A)": float(v) * amp})
+    st.write("**HDB3**: 4 zeros → `000V` (odd) OR `B00V` (even)")
+    st.dataframe(pd.DataFrame(h_rows), hide_index=True, width="stretch")
+
+    # Optional tiny visualizer plots (step waveforms)
+    st.markdown("### Pattern visualizer (waveform)")
+    cols_pat = st.columns(2)
+
+    def _pattern_plot(pat: list[int], title: str):
+        # show each symbol as one “bit” wide for visualization
+        Ns_viz = max(20, int(params.samples_per_bit))
+        t = np.arange(len(pat) * Ns_viz) / (Ns_viz / 1.0)  # 1s per symbol on x-axis (visual only)
+        x = np.repeat(np.asarray(pat, dtype=float) * amp, Ns_viz)
+        return plot_signal(t, x, title, grid=show_grid, step=True, x_dtick=1, y_dtick=amp)
+
+    with cols_pat[0]:
+        st.plotly_chart(_pattern_plot(b8, "B8ZS: 000VB0VB (ternary)"), width="stretch")
+    with cols_pat[1]:
+        # Show the parity that matches current UI assumption as the “main” one
+        chosen = hdb_even if int(hdb3_nonzero_since_violation_init) == 0 else hdb_odd
+        chosen_name = "even (B00V)" if int(hdb3_nonzero_since_violation_init) == 0 else "odd (000V)"
+        st.plotly_chart(_pattern_plot(chosen, f"HDB3: {chosen_name}"), width="stretch")
+
+    st.markdown("---")
+    st.markdown("## What our implementation does")
+    st.markdown(
+        """
+### Encoder output amplitude in the simulator
+Internally, Digital→Digital generates levels in **{−1, 0, +1}**.  
+In the UI, you scale it by **Line amplitude (±A)** so the plotted waveform becomes **{−A, 0, +A}**.
+
+### Decoding strategy in our code
+- Most schemes: sample mid-bit and map sign/zero → bit.
+- Manchester / Differential Manchester: compare first half vs second half of each bit interval.
+- B8ZS/HDB3: decode to ternary first (−1/0/+1), then descramble by recognizing violation patterns.
+        """
+    )
+
+    # ---------------------------------------------------------------------
+    # Visual example: now uses SAME “assumption visualization” logic as Waveforms compare
+    # ---------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("## Visual example: same input bits encoded with each scheme")
+
+    example_bits = [0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1]
+    st.caption("Using the common textbook example bit sequence: 01001100011")
+
+    demos = [
+        ("NRZ-L", dict()),
+        ("NRZI", dict(nrzi_start_level=nrzi_start_level)),
+        ("Manchester", dict()),
+        ("Differential Manchester", dict(diff_start_level=diff_start_level)),
+        ("Bipolar-AMI", dict(last_pulse_init=last_pulse_init)),
+        ("Pseudoternary", dict(last_zero_pulse_init=last_zero_pulse_init)),
+        ("B8ZS", dict(last_pulse_init=last_pulse_init)),
+        ("HDB3", dict(last_pulse_init=last_pulse_init, hdb3_nonzero_since_violation_init=hdb3_nonzero_since_violation_init)),
+    ]
+
+    def _prep_plot_for_scheme(s: str, t: np.ndarray, tx_scaled: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # Apply the SAME assumption-visualization rules used in Waveforms tab
+        t2 = t
+        x2 = tx_scaled
+
+        if s == "NRZ-L":
+            init_level = int(nrzl_prev_level) * float(line_amp)
+            t2 = np.concatenate([[0.0], t2])
+            x2 = np.concatenate([[init_level], x2])
+
+        if s == "NRZI":
+            init_level = int(nrzi_start_level) * float(line_amp)
+            t2 = np.concatenate([[0.0], t2])
+            x2 = np.concatenate([[init_level], x2])
+
+        if s == "Manchester":
+            prev_end_level = (+1 if int(manchester_prev_bit) == 1 else -1)
+            init_level = prev_end_level * float(line_amp)
+            t2 = np.concatenate([[0.0], t2])
+            x2 = np.concatenate([[init_level], x2])
+
+        if s == "Differential Manchester":
+            init_level = float(diff_start_level) * float(line_amp)
+            t2 = np.concatenate([[0.0], t2])
+            x2 = np.concatenate([[init_level], x2])
+
+        return t2, x2
+
+    def _assumption_note(s: str) -> str | None:
+        amp_s = f"{float(line_amp):g}"
+
+        if s == "NRZ-L":
+            lvl = "High" if int(nrzl_prev_level) > 0 else "Low"
+            sign = "+" if int(nrzl_prev_level) > 0 else "-"
+            return f"Assumed level BEFORE first bit: {lvl} ({sign}{amp_s})"
+
+        if s == "NRZI":
+            lvl = "High" if int(nrzi_start_level) > 0 else "Low"
+            sign = "+" if int(nrzi_start_level) > 0 else "-"
+            return f"Assumed level BEFORE first bit: {lvl} ({sign}{amp_s})"
+
+        if s == "Manchester":
+            return f"Assumed preceding bit: {int(manchester_prev_bit)}"
+
+        if s == "Differential Manchester":
+            lvl = "High" if float(diff_start_level) > 0 else "Low"
+            sign = "+" if float(diff_start_level) > 0 else "-"
+            return f"Assumed level BEFORE first bit: {lvl} ({sign}{amp_s})"
+
+        if s in ("Bipolar-AMI", "B8ZS", "HDB3"):
+            pol = "Positive" if int(last_pulse_init) > 0 else "Negative"
+            sign = "+" if int(last_pulse_init) > 0 else "-"
+            base = f"Assumed most recent preceding '1' polarity: {pol} ({sign}{amp_s})"
+            if s == "HDB3":
+                parity = "Even" if int(hdb3_nonzero_since_violation_init) == 0 else "Odd"
+                base += f", pulses since last substitution: {parity}"
+            return base
+
+        if s == "Pseudoternary":
+            pol = "Positive" if int(last_zero_pulse_init) > 0 else "Negative"
+            sign = "+" if int(last_zero_pulse_init) > 0 else "-"
+            return f"Assumed most recent preceding '0' polarity: {pol} ({sign}{amp_s})"
+
+        return None
+
+    cols = st.columns(2)
+    for i, (scheme_name, kw) in enumerate(demos):
+        r = simulate_d2d(example_bits, scheme_name, params, **kw)
+        tx = r.signals["tx"] * float(line_amp)
+        t2, tx2 = _prep_plot_for_scheme(scheme_name, r.t, tx)
+
+        note = _assumption_note(scheme_name)
+        title = f"{scheme_name}"
+        if note:
+            title = f"{scheme_name}  <span style='font-size:0.80em; opacity:0.8'>({note})</span>"
+
+        with cols[i % 2]:
+            st.plotly_chart(
+                plot_signal(t2, tx2, title, grid=show_grid, x_dtick=params.Tb, y_dtick=1),
+                width="stretch",
+            )
+
+    st.markdown("---")
+    st.markdown("## Key takeaways")
+    st.markdown(
+        """
+- **NRZ** is simple and bandwidth-efficient but can fail clock recovery on long constant runs.
+- **AMI/Pseudoternary** reduce DC; scrambling is needed to avoid long flat sections.
+- **Manchester-family** is self-clocking but increases transitions (more bandwidth).
+- **B8ZS/HDB3** keep AMI’s advantages while preventing long sequences of 0 line signal.
+        """
+    )
+
+def render_d2a_theory(
+    *,
+    params: SimParams,
+    show_grid: bool,
+    scheme_selected: str,
+    kwargs_selected: dict,
+) -> None:
+    """Render the beginner-friendly Theory tab for Digital → Analog (D2A)."""
+
+    st.markdown(
+        """
+## Digital → Analog (Modems): what’s happening?
+
+We start with **digital bits** (0/1) and turn them into a **bandpass analog waveform** by modulating a **carrier**:
+
+- Carrier: **cos(2π f_c t)** at frequency **f_c**
+- Each bit lasts **T_b** seconds and uses **N_s** samples  
+  ⇒ **f_s = N_s / T_b**
+
+In the book, the big three modulation families are:
+**ASK** (amplitude), **FSK** (frequency), **PSK** (phase).  
+In our simulator we also include multilevel variants (**MFSK**, **QPSK**, **QAM/16-QAM**).
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # 1) “Book ↔ our code” mapping
+    # ------------------------------------------------------------------
+    st.markdown("### Book definitions → how our code implements them")
+    st.markdown(
+        """
+Below, “**TX**” = waveform generation, and “**RX**” = how we recover bits.
+
+Our receiver is **coherent**: it correlates the received segment against local
+**cos/sin references** (I/Q correlator), then decides by amplitude/energy/phase.
+        """
+    )
+
+    rows = [
+        {
+            "Scheme": "ASK",
+            "Book idea": "Two amplitudes for 0/1 (often 0 vs A) — Eq (5.2)",
+            "Our TX": "s(t) = Ac·A(bit)·cos(2π f_c t) using A0/A1",
+            "Our RX": "I/Q at f_c → magnitude Â → threshold at (A0+A1)/2",
+        },
+        {
+            "Scheme": "BFSK",
+            "Book idea": "Two tones for 0/1 — Eq (5.3)",
+            "Our TX": "bit selects f0 or f1 (UI uses explicit f0,f1)",
+            "Our RX": "Energy at f0 vs f1 via I/Q → pick larger energy",
+        },
+        {
+            "Scheme": "MFSK",
+            "Book idea": "M tones; each symbol carries L=log2(M) bits — Eq (5.4)",
+            "Our TX": "Group bits by L → choose tone index → transmit that tone",
+            "Our RX": "Energy over all tones → argmax tone index → map back to L bits",
+        },
+        {
+            "Scheme": "BPSK",
+            "Book idea": "Two phases (0 and π) ≡ ±cos — Eq (5.5)/(5.6)",
+            "Our TX": "bit picks φ1 or φ0 (defaults: 0 and π)",
+            "Our RX": "Estimate phase via I/Q → choose closer of φ1 vs φ0",
+        },
+        {
+            "Scheme": "DPSK",
+            "Book idea": "Bit encodes phase change vs previous burst — Fig 5.10",
+            "Our TX": "Keep running phase; bit=1 adds Δφ (default π), bit=0 keeps phase",
+            "Our RX": "Estimate φ per bit → Δφ vs previous → decide 0/1",
+        },
+        {
+            "Scheme": "QPSK",
+            "Book idea": "2 bits/symbol; 4 phases — Eq (5.7), Fig 5.11",
+            "Our TX": "Split into I/Q; s(t)=(Ac/√2)(I·cos − Q·sin) with φ_ref",
+            "Our RX": "Correlate → recover I,Q signs → map back to 2 bits",
+        },
+        {
+            "Scheme": "QAM",
+            "Book idea": "Two ASK signals on orthogonal carriers — Fig 5.14; 16-QAM — Fig 5.15",
+            "Our TX": "axis_levels=2 → 4-QAM; axis_levels=4 → 16-QAM (Gray per axis)",
+            "Our RX": "Correlate → estimate I,Q → slice to valid levels → bits",
+        },
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    # ------------------------------------------------------------------
+    # 2) Beginner-friendly explanations
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("## 1) ASK — Amplitude Shift Keying")
+    st.markdown(
+        """
+**Idea:** keep the carrier frequency fixed, but change **amplitude** based on the bit.
+
+- Book Eq (5.2): one bit uses **A cos(2π f_c t)**, the other uses **0** (or a smaller amplitude).
+- In our UI you choose **A0** and **A1** (often A0=0).
+
+**RX decision in our code:** correlate at **f_c**, compute magnitude **Â ≈ √(I²+Q²)/Ac**, then compare to **(A0+A1)/2**.
+        """
+    )
+
+    st.markdown("## 2) FSK — Frequency Shift Keying (BFSK, MFSK)")
+    st.markdown(
+        """
+**BFSK:** bit 0 and bit 1 are two different tones near the carrier (Eq 5.3).  
+**MFSK:** extend that: each symbol chooses **one of M tones** and carries **L=log2(M)** bits (Eq 5.4).
+
+In our implementation:
+- **BFSK:** UI provides **f0/f1** explicitly (and RX uses the same two tones).
+- **MFSK:** you choose **L** and **fd** (Hz). We compute the tone set:
+  **f_i = f_c + (2i − 1 − M) f_d**, for i=1..M.
+
+**RX decision:** compute energy at each candidate frequency with I/Q correlation, then choose the maximum.
+        """
+    )
+
+    st.markdown("## 3) PSK — Phase Shift Keying (BPSK, DPSK, QPSK)")
+    st.markdown(
+        """
+**BPSK:** the carrier phase flips between two values (usually 0 and π).  
+Equivalent viewpoint: multiply the carrier by **+1** or **−1** (Eq 5.6).
+
+**DPSK:** instead of absolute phase, the bit is encoded in the **change relative to the previous bit**
+(Fig 5.10):  
+- 0 = same phase  
+- 1 = opposite phase (default Δφ=π)
+
+**QPSK:** group bits into pairs → 4 phases (Eq 5.7).  
+Book structure (Fig 5.11): split into **I** and **Q** streams (alternate bits), modulate cos & sin, and add.
+        """
+    )
+
+    st.markdown("## 4) QAM — Quadrature Amplitude Modulation")
+    st.markdown(
+        """
+**QAM = two ASK signals on orthogonal carriers**: one on **cos(2π f_c t)** and one on **sin(2π f_c t)** (Fig 5.14).
+
+In our simulator:
+- **axis_levels=2** → 4 states (often called 4-QAM)
+- **axis_levels=4** → 16 states (16-QAM, Fig 5.15) using Gray coding per axis.
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # 3) Constellations (QPSK + 16-QAM)
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("## Constellations (I–Q plane)")
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown("### QPSK (our mapping)")
+        # Keep the same display order as the book/our labeling
+        qpsk_order = [(1, 1), (0, 1), (0, 0), (1, 0)]
+        qpsk_points = [
+            ("".join(map(str, bpair)), QPSK_MAP[bpair][0], QPSK_MAP[bpair][1])
+            for bpair in qpsk_order
+        ]
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=[p[1] for p in qpsk_points],
+                y=[p[2] for p in qpsk_points],
+                mode="markers+text",
+                text=[p[0] for p in qpsk_points],
+                textposition="top center",
+            )
+        )
+        fig.update_layout(
+            xaxis_title="I level",
+            yaxis_title="Q level",
+            xaxis=dict(zeroline=True, range=[-1.1, 1.1]),
+            yaxis=dict(zeroline=True, range=[-1.1, 1.2]),
+            height=320,
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    with colB:
+        st.markdown("### 16-QAM (Gray per axis)")
+        axis_map = {
+            "".join(map(str, k)): int(v) if float(v).is_integer() else v
+            for k, v in QAM16_AXIS_MAP.items()
+        }
+        pts = [(f"{ib}{qb}", I, Q) for ib, I in axis_map.items() for qb, Q in axis_map.items()]
+        fig2 = go.Figure()
+        fig2.add_trace(
+            go.Scatter(
+                x=[p[1] for p in pts],
+                y=[p[2] for p in pts],
+                mode="markers",
+            )
+        )
+        fig2.update_layout(
+            xaxis_title="I level",
+            yaxis_title="Q level",
+            xaxis=dict(zeroline=True),
+            yaxis=dict(zeroline=True),
+            height=320,
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig2, width="stretch")
+
+    # ------------------------------------------------------------------
+    # 4) Visual example (SAME note/assumption style as Waveforms compare)
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("## Visual example: same input bits modulated with each scheme")
+
+    example_bits = [0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1]
+    st.caption("Using the common textbook example bit sequence: 01001100011")
+
+    # Match the Waveforms-tab compare list (including the SAME notes)
+    compare_items = [
+        {
+            "title": "ASK",
+            "scheme": "ASK",
+            "defaults": {"A0": 0.00, "A1": 1.00},
+            "note": "A0 = 0.00, A1 = 1.00",
+        },
+        {
+            "title": "BFSK",
+            "scheme": "BFSK",
+            "defaults": {"f0": 8.00, "f1": 12.00},
+            "note": "f0 = 8.00 Hz, f1 = 12.00 Hz",
+        },
+        {
+            "title": "MFSK",
+            "scheme": "MFSK",
+            "defaults": {"L": 2, "fd": 1.00},
+            "note": "L = 2 (M = 4), fd = 1.00 Hz",
+        },
+        {
+            "title": "BPSK",
+            "scheme": "BPSK",
+            "defaults": {"phase1": 0.0, "phase0": float(np.pi)},
+            "note": "Standard 'φ1 = 0.00 rad, φ0 = π rad'",
+        },
+        {
+            "title": "DPSK",
+            "scheme": "DPSK",
+            "defaults": {"phase_init": 0.0, "delta_phase": float(np.pi)},
+            "note": "φ_ref = 0.00 rad, Δφ = π rad",
+        },
+        {
+            "title": "QPSK",
+            "scheme": "QPSK",
+            "defaults": {"phi_ref": 0.0},
+            "note": "φ_ref = 0.00 rad",
+        },
+        {
+            "title": "QAM (2-level ASK)",
+            "scheme": "QAM",
+            "axis_levels": 2,
+            "defaults": {"axis_levels": 2, "phi_ref": 0.0},
+            "note": "2-level ASK (axis_levels = 2), φ_ref = 0.00 rad",
+        },
+        {
+            "title": "16-QAM (4-level ASK)",
+            "scheme": "QAM",
+            "axis_levels": 4,
+            "defaults": {"axis_levels": 4, "phi_ref": 0.0},
+            "note": "4-level ASK (axis_levels = 4), φ_ref = 0.00 rad",
+        },
+    ]
+
+    scheme_selected_u = str(scheme_selected).upper()
+    cur_axis_levels = None
+    if scheme_selected_u == "QAM":
+        try:
+            cur_axis_levels = int(kwargs_selected.get("axis_levels"))
+        except Exception:
+            cur_axis_levels = None
+
+    def _is_selected(item: dict) -> bool:
+        if str(item["scheme"]).upper() != scheme_selected_u:
+            return False
+        if scheme_selected_u != "QAM":
+            return True
+        return cur_axis_levels is not None and cur_axis_levels == int(item.get("axis_levels", -1))
+
+    cols = st.columns(2)
+    for idx, item in enumerate(compare_items):
+        selected = _is_selected(item)
+
+        kwargs_use = dict(kwargs_selected) if selected else dict(item["defaults"])
+        res2 = simulate_d2a(example_bits, item["scheme"], params, **kwargs_use)
+
+        if selected:
+            title = item["title"]
+        else:
+            title = (
+                f"{item['title']}  "
+                f"<span style='font-size:0.80em; opacity:0.8'>({item['note']})</span>"
+            )
+
+        with cols[idx % 2]:
+            st.plotly_chart(
+                plot_signal(res2.t, res2.signals["tx"], title, grid=show_grid, x_dtick=params.Tb),
+                width="stretch",
+            )
+
+    st.markdown("---")
+    st.markdown(
+        """
+## Key takeaways
+
+- **ASK** is simplest, but amplitude noise/gain changes can hurt it.
+- **FSK** is typically more robust than ASK; **MFSK** trades **more bandwidth** for better separation.
+- **PSK** is usually more bandwidth-efficient than ASK/FSK; **DPSK** avoids strict absolute phase reference.
+- **QPSK/QAM** pack more bits per symbol (higher bandwidth efficiency), but require cleaner channels
+  because constellation points are closer.
+        """
+    )
+
+def render_a2d_theory(
+    *,
+    res,
+    params: SimParams,
+    show_grid: bool,
+    technique: str,
+    kind: str,
+    Am: float,
+    fm: float,
+    duration: float,
+    fs_mult: int,
+    pcm_nbits: int,
+    dm_delta: float,
+    linecode_scheme: str,
+):
+    """
+    Theory tab for Analog → Digital (A2D).
+    Beginner-friendly + aligned with Stallings Ch.5.3 and our a2d.py implementation.
+    Uses the already-computed simulation result `res` to visualize what is actually happening.
+    """
+
+    st.markdown("## Analog data → Digital signals (Digitization)")
+
+    st.markdown(
+        """
+Digitization converts a continuous-time analog waveform into a **bitstream**.
+
+In Stallings §5.3, the “codec” does two main things:  
+1) **Sample** the analog signal (PAM samples).  
+2) Convert samples into **digital data** using either **PCM** or **DM**, then transmit as a digital signal (often with line coding).  
+        """
+    )
+
+    # -------------------------
+    # Sampling theorem (PCM basis)
+    # -------------------------
+    st.markdown("### Sampling (PAM) and the sampling theorem")
+
+    fs_samp = float(res.meta.get("sampler", {}).get("fs_samp", float(fs_mult) * float(fm)))
+    Ts = float(res.meta.get("sampler", {}).get("Ts", 1.0 / fs_samp))
+
+    st.markdown(
+        f"""
+- We sample at: **fs_samp = fs_mult × fm = {fs_mult} × {fm:.3g} = {fs_samp:.3g} Hz**  
+- Sampling interval: **Ts = 1/fs_samp = {Ts:.6g} s**
+
+**Sampling theorem (Stallings):** to preserve all information for an ideal bandlimited signal with highest frequency **B**, sample at **fs ≥ 2B**.  
+In the simulator, `fs_mult` is a practical way to oversample relative to `fm`.
+        """
+    )
+
+    # Visual: message + samples (same style as Waveforms tab)
+    st.markdown("#### Visual: message with sampling instants")
+    t_s = res.meta["sampled"]["t_s"]
+    m_s = res.meta["sampled"]["m_s"]
+
+    x_dt = 0.5
+    tickvals = np.arange(0, duration + 1e-9, x_dt)
+    common_margin = dict(l=60, r=20, t=90, b=50)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=res.t, y=res.signals["m(t)"], mode="lines", name="m(t)"))
+    fig.add_trace(
+        go.Scatter(
+            x=t_s,
+            y=m_s,
+            mode="markers",
+            name="Samples",
+            marker=dict(color="#FF4B4B", size=8),
+        )
+    )
+
+    # annotate Ts and a couple of sample indices (beginner-friendly)
+    if len(t_s) >= 2:
+        fig.add_annotation(
+            x=float(t_s[1]),
+            y=float(m_s[1]),
+            text=f"Ts = {Ts:.3g}s",
+            showarrow=True,
+            arrowhead=2,
+            ax=30,
+            ay=-35,
+        )
+    if len(t_s) > 0:
+        fig.add_annotation(
+            x=float(t_s[0]),
+            y=float(m_s[0]),
+            text="k=0",
+            showarrow=True,
+            arrowhead=2,
+            ax=20,
+            ay=-25,
+        )
+
+    fig.update_layout(
+        title="Sampling (PAM): continuous message and sampled points",
+        xaxis_title="Time (s)",
+        yaxis_title="Amplitude",
+        legend=dict(
+            orientation="h",
+            x=1.0,
+            y=1.13,
+            xanchor="right",
+            yanchor="bottom",
+            xref="paper",
+            yref="paper",
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        margin=common_margin,
+    )
+    if show_grid:
+        fig.update_xaxes(showgrid=True)
+        fig.update_yaxes(showgrid=True)
+
+    fig.update_xaxes(range=[0, duration], autorange=False)
+    fig.update_xaxes(tickmode="array", tickvals=tickvals)
+
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("---")
+
+    # -------------------------
+    # PCM
+    # -------------------------
+    st.markdown("## PCM (Pulse Code Modulation)")
+
+    st.markdown(
+        """
+PCM converts each PAM sample into an **n-bit codeword**:
+
+**Pipeline (book-style):**  
+Analog → PAM sampler → **Quantizer** (L = 2ⁿ levels) → **Encoder** (n-bit blocks) → digital bitstream.
+
+In our implementation:
+- Sampling is exact (endpoint excluded so we do not create an extra sample at *t = duration*).
+- Quantizer is **uniform** over [−Am, +Am] with **mid-rise reconstruction**.
+- Then we optionally apply **line coding** to the produced bitstream using the same D2D encoder/decoder.  
+        """
+    )
+
+    # Derived PCM facts (book + our meta)
+    pcm = res.meta.get("pcm", None)
+    if pcm is None:
+        st.info("PCM theory is shown when the selected technique is PCM.")
+    else:
+        n_bits = int(pcm.get("n_bits", pcm_nbits))
+        L = int(pcm.get("L", 2**n_bits))
+        q_delta = float(pcm.get("delta", np.nan))
+        snr_est = float(pcm.get("snr_db_est", 6.02 * n_bits + 1.76))
+
+        R = fs_samp * n_bits
+
+        st.markdown("### Key parameters and the book SNR rule")
+        rows = [
+            {"Item": "Bits per sample (n)", "Value": str(n_bits)},
+            {"Item": "Quantization levels (L = 2^n)", "Value": str(L)},
+            {"Item": "Quantization step (Δ)", "Value": f"{q_delta:.6g}"},
+            {"Item": "Sampling rate (fs_samp)", "Value": f"{fs_samp:.6g} Hz"},
+            {"Item": "Raw bit rate (R = fs_samp × n)", "Value": f"{R:.6g} bps"},
+            {"Item": "SNR estimate (book): 6.02n + 1.76 dB", "Value": f"{snr_est:.2f} dB"},
+            {"Item": "Line coding used for transmission", "Value": str(linecode_scheme)},
+        ]
+        st.dataframe(
+            pd.DataFrame(rows),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Item": st.column_config.TextColumn("Item", width="medium"),
+                "Value": st.column_config.TextColumn("Value", width="medium"),
+            },
+        )
+
+        st.markdown("### Visual: quantization staircase (TX vs RX)")
+
+        stair_tx = res.meta.get("stair_tx", None)
+        stair_rx = res.meta.get("stair_rx", None)
+
+        fig2 = go.Figure()
+
+        if stair_tx is not None:
+            fig2.add_trace(
+                go.Scatter(
+                    x=stair_tx["t_s"],
+                    y=stair_tx["x"],
+                    mode="lines",
+                    line_shape="hv",
+                    name="Quantized (TX)",
+                    opacity=0.75,
+                )
+            )
+
+        if stair_rx is not None:
+            fig2.add_trace(
+                go.Scatter(
+                    x=stair_rx["t_s"],
+                    y=stair_rx["x"],
+                    mode="lines",
+                    line_shape="hv",
+                    name="After line-decode + PCM decode (RX)",
+                    line=dict(color="#FF4B4B", dash="dash", width=2),
+                    opacity=0.95,
+                )
+            )
+
+        # Add light horizontal guides at a few quantization levels (beginner-friendly)
+        qvals = np.asarray(pcm.get("q", []), dtype=float)
+        if qvals.size > 0:
+            uniq = np.unique(np.round(qvals, 12))
+            # pick up to ~8 evenly spaced levels to avoid clutter
+            if len(uniq) > 8:
+                idxs = np.linspace(0, len(uniq) - 1, 8).round().astype(int)
+                levels = uniq[idxs]
+            else:
+                levels = uniq
+
+            for lv in levels.tolist():
+                fig2.add_hline(y=float(lv), line_width=1, opacity=0.12)
+
+        fig2.update_layout(
+            title="PCM quantization: staircase representation (mid-rise reconstruction)",
+            xaxis_title="Time (s)",
+            yaxis_title="Amplitude",
+            legend=dict(
+                orientation="h",
+                x=1.0,
+                y=1.13,
+                xanchor="right",
+                yanchor="bottom",
+                xref="paper",
+                yref="paper",
+                bgcolor="rgba(0,0,0,0)",
+            ),
+            margin=common_margin,
+        )
+        if show_grid:
+            fig2.update_xaxes(showgrid=True)
+            fig2.update_yaxes(showgrid=True)
+        fig2.update_xaxes(range=[0, duration], autorange=False)
+        fig2.update_xaxes(tickmode="array", tickvals=tickvals)
+
+        st.plotly_chart(fig2, width="stretch")
+
+        st.markdown("### Mini walk-through (like the book example table)")
+
+        steps = pcm.get("steps", [])
+        if isinstance(steps, list) and len(steps) > 0:
+            show_n = min(12, len(steps))
+            st.caption(f"Showing the first {show_n} samples (k = 0..{show_n-1}).")
+            render_events_table(steps[:show_n], width=1100)
+        else:
+            st.info("No PCM step table found in meta.")
+
+    st.markdown("---")
+
+    # -------------------------
+    # DM
+    # -------------------------
+    st.markdown("## DM (Delta Modulation)")
+
+    st.markdown(
+        """
+Delta Modulation encodes **changes** instead of absolute amplitudes.
+
+**Book logic (feedback staircase):**  
+At each sample time:
+- compare the input sample **x[k]** with the current staircase estimate **est[k]**
+- output **1** if x[k] ≥ est[k] else **0**
+- update the staircase for the next interval by **±Δ**
+
+So DM produces **1 bit per sample**, and the receiver rebuilds the staircase by applying the same ±Δ updates.
+        """
+    )
+
+    dm = res.meta.get("dm", None)
+    if dm is None:
+        st.info("DM theory is shown when the selected technique is DM.")
+    else:
+        delta = float(dm.get("delta", dm_delta))
+        est0 = float(dm.get("est0", 0.0))
+        R_dm = fs_samp * 1.0
+
+        st.markdown("### Key parameters")
+        rows = [
+            {"Item": "Step size (Δ)", "Value": f"{delta:.6g}"},
+            {"Item": "Initial estimate (est0)", "Value": f"{est0:.6g}"},
+            {"Item": "Sampling rate (fs_samp)", "Value": f"{fs_samp:.6g} Hz"},
+            {"Item": "Raw bit rate (R = fs_samp × 1)", "Value": f"{R_dm:.6g} bps"},
+            {"Item": "Line coding used for transmission", "Value": str(linecode_scheme)},
+        ]
+        st.dataframe(
+            pd.DataFrame(rows),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Item": st.column_config.TextColumn("Item", width="medium"),
+                "Value": st.column_config.TextColumn("Value", width="medium"),
+            },
+        )
+
+        st.markdown("### The two classic DM errors (book intuition)")
+
+        st.markdown(
+            """
+- **Quantizing noise:** when the analog waveform changes slowly, big Δ makes the staircase “bounce” around the true signal.  
+- **Slope overload:** when the waveform rises/falls too fast, small Δ cannot keep up (staircase lags behind).
+
+To reduce slope overload: increase **fs_samp** and/or increase **Δ**.  
+To reduce quantizing noise: decrease **Δ** (but this risks slope overload).
+            """
+        )
+
+        st.markdown("### Visual: DM staircase tracking")
+
+        stair_tx = res.meta.get("stair_tx", None)
+        stair_rx = res.meta.get("stair_rx", None)
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=res.t, y=res.signals["m(t)"], mode="lines", name="m(t)", opacity=0.55))
+
+        if stair_tx is not None:
+            fig3.add_trace(
+                go.Scatter(
+                    x=stair_tx["t_s"],
+                    y=stair_tx["x"],
+                    mode="lines",
+                    line_shape="hv",
+                    name="Staircase (TX)",
+                    opacity=0.85,
+                )
+            )
+        if stair_rx is not None:
+            fig3.add_trace(
+                go.Scatter(
+                    x=stair_rx["t_s"],
+                    y=stair_rx["x"],
+                    mode="lines",
+                    line_shape="hv",
+                    name="Staircase (RX)",
+                    line=dict(color="#FF4B4B", dash="dash", width=2),
+                    opacity=0.95,
+                )
+            )
+
+        # annotate Δ on the left as a simple visual cue
+        fig3.add_annotation(
+            x=0.02 * duration,
+            y=float(est0 + delta),
+            text=f"Δ = {delta:.3g}",
+            showarrow=True,
+            arrowhead=2,
+            ax=20,
+            ay=-30,
+        )
+
+        fig3.update_layout(
+            title="Delta Modulation: staircase approximation (TX vs RX) overlaid on the message",
+            xaxis_title="Time (s)",
+            yaxis_title="Amplitude",
+            legend=dict(
+                orientation="h",
+                x=1.0,
+                y=1.13,
+                xanchor="right",
+                yanchor="bottom",
+                xref="paper",
+                yref="paper",
+                bgcolor="rgba(0,0,0,0)",
+            ),
+            margin=common_margin,
+        )
+        if show_grid:
+            fig3.update_xaxes(showgrid=True)
+            fig3.update_yaxes(showgrid=True)
+        fig3.update_xaxes(range=[0, duration], autorange=False)
+        fig3.update_xaxes(tickmode="array", tickvals=tickvals)
+
+        st.plotly_chart(fig3, width="stretch")
+
+        st.markdown("### Mini walk-through (comparator → bit → staircase update)")
+
+        steps = dm.get("steps", [])
+        if isinstance(steps, list) and len(steps) > 0:
+            show_n = min(12, len(steps))
+            st.caption(f"Showing the first {show_n} samples (k = 0..{show_n-1}).")
+            render_events_table(steps[:show_n], width=1100)
+        else:
+            st.info("No DM step table found in meta.")
+
+    st.markdown("---")
+
+    # -------------------------
+    # Transmission stage (line coding) — shared by PCM/DM in our implementation
+    # -------------------------
+    st.markdown("## Transmission stage in *our* simulator: line coding the produced bits")
+
+    line_meta = res.meta.get("linecode", {})
+    match = bool(line_meta.get("match", False))
+    bit_len = int(line_meta.get("bit_len", 0))
+
+    st.markdown(
+        f"""
+After PCM/DM produces bits, we transmit them as a digital waveform using **{linecode_scheme}**:
+
+- TX: `line_encode(bitstream, scheme)`  
+- RX: `line_decode(waveform, scheme)` → back to bits  
+- Then PCM/DM decode reconstructs the samples/staircase.
+
+**Bitstream length:** {bit_len}  
+**Match after line-decode:** {"✅ MATCH" if match else "❌ MISMATCH"}
+        """
+    )
+
+    # Show a small excerpt of bits (beginner-friendly)
+    bits_tx = res.bits.get("bitstream", [])
+    bits_rx = res.bits.get("decoded_bitstream", [])
+    s_tx = "".join("1" if b else "0" for b in bits_tx)[:160]
+    s_rx = "".join("1" if b else "0" for b in bits_rx)[:160]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("TX bits (prefix)")
+        st.code(s_tx + ("..." if len(bits_tx) > 160 else ""))
+    with c2:
+        st.caption("RX bits (prefix)")
+        st.code(s_rx + ("..." if len(bits_rx) > 160 else ""))
+
+    st.markdown(
+        """
+> Note: This “line coding” stage is exactly the same family of schemes we have in **Digital → Digital**.
+We reuse it here because Stallings explicitly notes that once you have digital data, you can transmit it with a line code.  
+        """
+    )
+
+def render_a2a_theory(
+    *,
+    params: SimParams,
+    show_grid: bool,
+    scheme_selected: str,
+    kind_selected: str,
+    Am: float,
+    fm: float,
+    duration: float,
+    na: float,
+    nf: float,
+    np_: float,
+    res: SimResult,
+) -> None:
+    """Render the beginner-friendly Theory tab for Analog → Analog (A2A)."""
+
+    fs = float(params.fs)
+    fc = float(params.fc)
+    Ac = float(params.Ac)
+
+    scheme = str(scheme_selected).upper()
+    kind = str(kind_selected).lower()
+
+    t = np.asarray(res.t, dtype=float)
+    m = np.asarray(res.signals.get("m(t)", []), dtype=float)
+    s = np.asarray(res.signals.get("tx", []), dtype=float)
+
+    st.markdown(
+        r"""
+## Analog → Analog (AM / FM / PM): what’s happening?
+
+We start with an **analog message** \(m(t)\) (voice-like baseband), and shift it to a **higher-frequency carrier** around \(f_c\).
+This is useful for:
+- **Practical transmission at high frequency** (especially wireless antennas)
+- **Frequency-division multiplexing (FDM)**
+
+In this simulator, we implement the Chapter 16.1 “book forms”, and we also show a clean “ideal-demod” view (envelope / phase / inst. frequency) so you can *see* what the modulation did.
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # Book ↔ our code mapping
+    # ------------------------------------------------------------------
+    st.markdown("### Book definitions → how our code implements them")
+
+    rows = []
+
+    if scheme == "AM":
+        am_meta = res.meta.get("am", {})
+        mu = float(am_meta.get("modulation_index_mu", abs(float(na))))
+
+        rows.append(
+            {
+                "Item": "AM (DSB transmitted carrier)",
+                "Book idea": r"$s(t)=A_c[1+n_a x(t)]\cos(2\pi f_c t)$, with $|x(t)|\le 1$",
+                "Our TX": r"`am_modulate`:  $s(t)=A_c[1+n_a x(t)]\sin(2\pi f_c t)$",
+                "Notes": r"We normalize $x(t)=m(t)/\max|m(t)|$, so the book modulation index is $\mu=|n_a|$.",
+            }
+        )
+        rows.append(
+            {
+                "Item": "Envelope (why it works)",
+                "Book idea": r"Envelope = $A_c[1+n_a x(t)]$ if $\mu\le 1$ (no zero-crossing)",
+                "Our RX": r"`am_demodulate_envelope`: Hilbert envelope, then $x̂=(env/A_c-1)/n_a$, then rescale to $m̂$",
+                "Notes": "If μ>1, envelope crosses 0 → envelope detection distorts (overmodulation).",
+            }
+        )
+
+        derived_rows = {
+            "Scheme": "AM",
+            "fs (Hz)": fs,
+            "fc (Hz)": fc,
+            "Ac": Ac,
+            "Message": f"{kind}, Am={Am:.3g}, fm={fm:.3g} Hz",
+            "Book μ = |n_a|": mu,
+            "Overmodulated?": bool(mu > 1.0),
+            "AM bandwidth hint (single-tone)": float(am_meta.get("bandwidth_hint_hz", 2.0 * float(fm))),
+        }
+
+    elif scheme == "FM":
+        fm_meta = res.meta.get("fm", {})
+        delta_f = float(fm_meta.get("delta_f_max_hz", np.nan))
+        beta = float(fm_meta.get("beta_index", np.nan))
+        bw = float(fm_meta.get("bw_carson_hz", np.nan))
+
+        rows.append(
+            {
+                "Item": "Angle modulation (general)",
+                "Book idea": r"$s(t)=A_c\cos(2\pi f_c t+\phi(t))$",
+                "Our TX": "We implement the same idea, using `sin(...)` instead of `cos(...)` (just a phase shift).",
+                "Notes": "AM changes amplitude; FM/PM keep amplitude ≈ constant and change angle.",
+            }
+        )
+        rows.append(
+            {
+                "Item": "FM definition",
+                "Book idea": r"$\phi'(t)=n_f m(t)\ \Rightarrow\ \phi(t)=\int n_f m(\tau)\,d\tau$",
+                "Our TX": r"`fm_modulate`: $\phi(t)\approx \mathrm{cumsum}(m)\cdot n_f/f_s$",
+                "Notes": r"Peak deviation: $\Delta F=\frac{n_f A_m}{2\pi}$; FM index $\beta=\Delta F/f_m$.",
+            }
+        )
+        rows.append(
+            {
+                "Item": "FM demod (visual)",
+                "Book idea": r"Instantaneous frequency $f_i(t)=\frac{1}{2\pi}\frac{d}{dt}(\text{phase})$",
+                "Our RX": r"`fm_demodulate_instfreq`: Hilbert→unwrap phase→gradient→$f_i(t)$→$m̂(t)=\frac{2\pi}{n_f}(f_i-f_c)$",
+                "Notes": "We apply reflect-padding + light smoothing to avoid edge spikes in the displayed window.",
+            }
+        )
+
+        derived_rows = {
+            "Scheme": "FM",
+            "fs (Hz)": fs,
+            "fc (Hz)": fc,
+            "Ac": Ac,
+            "Message": f"{kind}, Am={Am:.3g}, fm={fm:.3g} Hz",
+            "n_f (rad/s per unit)": float(fm_meta.get("nf_rad_per_s_per_unit", nf)),
+            "ΔF max (Hz)": delta_f,
+            "β = ΔF/fm": beta,
+            "Carson BW ≈ 2(ΔF+fm) (Hz)": bw,
+        }
+
+    else:  # PM
+        pm_meta = res.meta.get("pm", {})
+        dphi = float(pm_meta.get("delta_phi_max_rad", np.nan))
+        df = float(pm_meta.get("delta_f_max_hz_sine_approx", np.nan))
+        bw = float(pm_meta.get("bw_carson_hz_sine_approx", np.nan))
+
+        rows.append(
+            {
+                "Item": "Angle modulation (general)",
+                "Book idea": r"$s(t)=A_c\cos(2\pi f_c t+\phi(t))$",
+                "Our TX": "We implement the same idea, using `sin(...)` instead of `cos(...)` (just a phase shift).",
+                "Notes": "AM changes amplitude; FM/PM keep amplitude ≈ constant and change angle.",
+            }
+        )
+        rows.append(
+            {
+                "Item": "PM definition",
+                "Book idea": r"$\phi(t)=n_p m(t)$",
+                "Our TX": r"`pm_modulate`: $s(t)=A_c\sin(2\pi f_c t+n_p m(t))$",
+                "Notes": r"Peak phase deviation: $\Delta\phi_{\max}=n_p A_m$.",
+            }
+        )
+        rows.append(
+            {
+                "Item": "PM demod (visual)",
+                "Book idea": r"Extract phase deviation: $\phi_{\text{dev}}(t)=\text{phase}-2\pi f_c t$",
+                "Our RX": r"`pm_demodulate_phase`: Hilbert→unwrap phase→subtract carrier phase→$m̂(t)=\phi_{\text{dev}}/n_p$",
+                "Notes": "We remove residual DC bias in phase deviation for a clean overlay plot.",
+            }
+        )
+
+        derived_rows = {
+            "Scheme": "PM",
+            "fs (Hz)": fs,
+            "fc (Hz)": fc,
+            "Ac": Ac,
+            "Message": f"{kind}, Am={Am:.3g}, fm={fm:.3g} Hz",
+            "n_p (rad per unit)": float(pm_meta.get("np_rad_per_unit", np_)),
+            "Δφ max (rad)": dphi,
+            "ΔF max (Hz, single-tone approx)": df,
+            "Carson BW ≈ 2(ΔF+fm) (Hz)": bw,
+        }
+
+    df_map = pd.DataFrame(rows)
+    st.dataframe(
+        df_map,
+        hide_index=True,
+        width=1100,
+        column_config={
+            "Item": st.column_config.TextColumn("Item", width="medium"),
+            "Book idea": st.column_config.TextColumn("Book idea", width="large"),
+            "Our TX": st.column_config.TextColumn("Our TX", width="large"),
+            "Notes": st.column_config.TextColumn("Notes", width="large"),
+        },
+    )
+
+    st.markdown("### Key parameters (current settings)")
+    dict_to_pretty_table(
+        derived_rows,
+        width=900,
+        default_float_fmt=".6g",
+        float_formats={
+            "fs (Hz)": ".0f",
+            "fc (Hz)": ".2f",
+            "Ac": ".3f",
+            "AM bandwidth hint (single-tone)": ".0f",
+            "ΔF max (Hz)": ".3f",
+            "β = ΔF/fm": ".4f",
+            "Carson BW ≈ 2(ΔF+fm) (Hz)": ".0f",
+            "Δφ max (rad)": ".4f",
+            "ΔF max (Hz, single-tone approx)": ".3f",
+        },
+    )
+
+    # ------------------------------------------------------------------
+    # Visuals: book-like intuition (time + spectrum)
+    # ------------------------------------------------------------------
+    st.markdown("### Visual intuition (time domain)")
+
+    if t.size == 0 or m.size == 0 or s.size == 0:
+        st.info("No samples available to visualize.")
+        return
+
+    # A “nice-looking” zoom window (a few carrier cycles), without changing the actual simulation.
+    zoom_seconds = min(float(duration), max(2.0 / float(fm), 10.0 / float(fc)))
+    zoom_seconds = max(0.05, zoom_seconds)
+    idx = (t >= 0.0) & (t <= zoom_seconds)
+
+    common_margin = dict(t=80, r=20, l=20, b=40)
+    legend_above = dict(
+        orientation="h",
+        x=1.0,
+        y=1.12,
+        xanchor="right",
+        yanchor="bottom",
+        xref="paper",
+        yref="paper",
+        bgcolor="rgba(0,0,0,0)",
+    )
+
+    # Message
+    fig_m = go.Figure()
+    fig_m.add_trace(go.Scatter(x=t[idx], y=m[idx], mode="lines", name="m(t)"))
+    fig_m.update_layout(
+        title=f"Message m(t) (zoom: 0 → {zoom_seconds:.3g}s)",
+        xaxis_title="Time (s)",
+        yaxis_title="Amplitude",
+        showlegend=False,
+        margin=common_margin,
+    )
+    if show_grid:
+        fig_m.update_xaxes(showgrid=True)
+        fig_m.update_yaxes(showgrid=True)
+    st.plotly_chart(fig_m, width="stretch")
+
+    # Modulated + any “book helper curve”
+    fig_s = go.Figure()
+    fig_s.add_trace(go.Scatter(x=t[idx], y=s[idx], mode="lines", name="s(t) (TX)"))
+
+    if scheme == "AM":
+        env_th = res.signals.get("envelope_theory", None)
+        env_est = res.signals.get("envelope_est", None)
+
+        if env_th is not None:
+            env_th = np.asarray(env_th, dtype=float)
+            fig_s.add_trace(
+                go.Scatter(
+                    x=t[idx],
+                    y=env_th[idx],
+                    mode="lines",
+                    name="+Envelope (theory)",
+                    line=dict(dash="dash", width=2),
+                    opacity=0.9,
+                )
+            )
+            fig_s.add_trace(
+                go.Scatter(
+                    x=t[idx],
+                    y=-env_th[idx],
+                    mode="lines",
+                    name="-Envelope (theory)",
+                    line=dict(dash="dash", width=2),
+                    opacity=0.9,
+                )
+            )
+
+        if env_est is not None:
+            env_est = np.asarray(env_est, dtype=float)
+            fig_s.add_trace(
+                go.Scatter(
+                    x=t[idx],
+                    y=env_est[idx],
+                    mode="lines",
+                    name="Envelope (estimated)",
+                    line=dict(width=2),
+                    opacity=0.7,
+                )
+            )
+
+    elif scheme == "FM":
+        inst_f = res.signals.get("inst_freq", None)
+        if inst_f is not None:
+            inst_f = np.asarray(inst_f, dtype=float)
+            # Put the inst-freq as a second figure (cleaner than a second y-axis for beginners)
+            fig_f = go.Figure()
+            fig_f.add_trace(go.Scatter(x=t, y=inst_f, mode="lines", name="Instantaneous frequency"))
+            fig_f.add_trace(go.Scatter(x=[t[0], t[-1]], y=[fc, fc], mode="lines", name="fc (reference)", line=dict(dash="dash")))
+            fig_f.update_layout(
+                title="FM: instantaneous frequency fᵢ(t) (should swing around fc)",
+                xaxis_title="Time (s)",
+                yaxis_title="Hz",
+                legend=legend_above,
+                margin=common_margin,
+            )
+            if show_grid:
+                fig_f.update_xaxes(showgrid=True)
+                fig_f.update_yaxes(showgrid=True)
+            st.plotly_chart(fig_f, width="stretch")
+
+    else:  # PM
+        ph = res.signals.get("phase_dev", None)
+        if ph is not None:
+            ph = np.asarray(ph, dtype=float)
+            fig_p = go.Figure()
+            fig_p.add_trace(go.Scatter(x=t, y=ph, mode="lines", name="Phase deviation φ_dev(t)"))
+            fig_p.update_layout(
+                title="PM: extracted phase deviation φ_dev(t)",
+                xaxis_title="Time (s)",
+                yaxis_title="Radians",
+                legend=legend_above,
+                margin=common_margin,
+            )
+            if show_grid:
+                fig_p.update_xaxes(showgrid=True)
+                fig_p.update_yaxes(showgrid=True)
+            st.plotly_chart(fig_p, width="stretch")
+
+    fig_s.update_layout(
+        title=f"Modulated signal s(t) ({scheme}) (zoom: 0 → {zoom_seconds:.3g}s)",
+        xaxis_title="Time (s)",
+        yaxis_title="Amplitude",
+        legend=legend_above,
+        margin=common_margin,
+    )
+    if show_grid:
+        fig_s.update_xaxes(showgrid=True)
+        fig_s.update_yaxes(showgrid=True)
+    st.plotly_chart(fig_s, width="stretch")
+
+    # Recovered overlay (what your Waveforms tab shows, but explained)
+    mr = np.asarray(res.signals.get("recovered", []), dtype=float)
+    if mr.size == t.size and mr.size > 0:
+        fig_r = go.Figure()
+        fig_r.add_trace(
+            go.Scatter(
+                x=t,
+                y=mr,
+                mode="lines",
+                name="Recovered (ideal RX)",
+                line=dict(color="#ff4b4b", width=2),
+            )
+        )
+
+        fig_r.add_trace(go.Scatter(x=t, y=m, mode="lines", name="m(t) (original)", line=dict(dash="dash"), opacity=0.7))
+        fig_r.update_layout(
+            title="Recovered vs original (ideal-demod visualization)",
+            xaxis_title="Time (s)",
+            yaxis_title="Amplitude",
+            legend=legend_above,
+            margin=common_margin,
+        )
+        if show_grid:
+            fig_r.update_xaxes(showgrid=True)
+            fig_r.update_yaxes(showgrid=True)
+        st.plotly_chart(fig_r, width="stretch")
+
+    # ------------------------------------------------------------------
+    # Spectrum intuition (beginner-friendly, minimal math)
+    # ------------------------------------------------------------------
+    st.markdown("### Visual intuition (frequency domain / spectrum)")
+
+    def _rfft_mag(x: np.ndarray, fs_hz: float) -> tuple[np.ndarray, np.ndarray]:
+        x = np.asarray(x, dtype=float)
+        if x.size == 0:
+            return np.array([]), np.array([])
+        X = np.fft.rfft(x * np.hanning(x.size))
+        f = np.fft.rfftfreq(x.size, d=1.0 / float(fs_hz))
+        mag = np.abs(X)
+        mag = mag / (np.max(mag) + 1e-12)
+        return f, mag
+
+    fm_f, fm_mag = _rfft_mag(m, fs)
+    fs_f, fs_mag = _rfft_mag(s, fs)
+
+    # Show a band around fc for s(t), and baseband for m(t)
+    if fm_f.size > 0 and fs_f.size > 0:
+        fig_spec = go.Figure()
+
+        # message baseband (0..maybe 5*fm)
+        fmax_m = min(float(fs) / 2.0, max(10.0 * float(fm), 5.0 * float(fm)))
+        im = fm_f <= fmax_m
+        fig_spec.add_trace(go.Scatter(x=fm_f[im], y=fm_mag[im], mode="lines", name="|M(f)| (message, baseband)"))
+
+        # modulated band around fc (fc ± 5*fm, clipped)
+        span = 5.0 * float(fm)
+        f_lo = max(0.0, float(fc) - span)
+        f_hi = min(float(fs) / 2.0, float(fc) + span)
+        isel = (fs_f >= f_lo) & (fs_f <= f_hi)
+        fig_spec.add_trace(go.Scatter(x=fs_f[isel], y=fs_mag[isel], mode="lines", name="|S(f)| (modulated, near fc)"))
+
+        # Reference lines for fc and sideband edges (AM intuition)
+        fig_spec.add_trace(go.Scatter(x=[fc, fc], y=[0, 1], mode="lines", name="fc", line=dict(dash="dash")))
+        if scheme == "AM":
+            fig_spec.add_trace(go.Scatter(x=[fc - fm, fc - fm], y=[0, 1], mode="lines", name="fc−fm", line=dict(dash="dot")))
+            fig_spec.add_trace(go.Scatter(x=[fc + fm, fc + fm], y=[0, 1], mode="lines", name="fc+fm", line=dict(dash="dot")))
+
+        fig_spec.update_layout(
+            title="Spectrum intuition: baseband vs bandpass (normalized magnitudes)",
+            xaxis_title="Frequency (Hz)",
+            yaxis_title="Normalized magnitude",
+            legend=legend_above,
+            margin=common_margin,
+        )
+        if show_grid:
+            fig_spec.update_xaxes(showgrid=True)
+            fig_spec.update_yaxes(showgrid=True)
+        st.plotly_chart(fig_spec, width="stretch")
+
+    st.markdown(
+        r"""
+### Quick reading guide
+
+- **AM**: sidebands sit at \(f_c \pm\) (message frequencies). For a single tone at \(f_m\), you clearly see energy near \(f_c\pm f_m\).  
+- **FM/PM**: many sidebands can appear (nonlinear angle term). Carson’s rule gives a practical bandwidth estimate.
+        """
+    )
+
+def empty_state(message: str = "Choose a scheme, optionally generate bits, then click **Run simulation**."):
+    # Centered, friendly placeholder
+    st.markdown(
+        """
+        <div style="text-align:center; padding: 6rem 1rem; opacity: 0.95;">
+            <div style="font-size: 4rem; line-height: 1;">📡</div>
+            <div style="font-size: 1.35rem; font-weight: 600; margin-top: 0.75rem;">
+                Ready when you are
+            </div>
+            <div style="font-size: 1.05rem; margin-top: 0.5rem;">
+        """
+        + message +
+        """
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def phase_as_pi_frac(x: float, *, max_den: int = 16) -> str:
+    """
+    Approximate x (radians) as k*pi/n with small denominator.
+    Returns strings like 'π/4', '-3π/4', 'π', '0', etc.
+    """
+    if not np.isfinite(x):
+        return ""
+
+    # represent as multiple of pi
+    r = float(x) / float(np.pi)
+
+    best_num, best_den, best_err = 0, 1, float("inf")
+    for den in range(1, max_den + 1):
+        num = int(round(r * den))
+        err = abs(r - (num / den))
+        if err < best_err:
+            best_num, best_den, best_err = num, den, err
+
+    # build pretty string
+    num = best_num
+    den = best_den
+
+    if num == 0:
+        return "0"
+    sign = "-" if num < 0 else ""
+    num = abs(num)
+
+    if den == 1:
+        return f"{sign}π" if num == 1 else f"{sign}{num}π"
+    else:
+        if num == 1:
+            return f"{sign}π/{den}"
+        return f"{sign}{num}π/{den}"
+
+def make_signature(mode: str, params: SimParams, **kwargs):
+    # Use only JSON-serializable primitives
+    base = {
+        "mode": mode,
+        "fs": float(params.fs),
+        "Tb": float(params.Tb),
+        "Ns": int(params.samples_per_bit),
+        "Ac": float(params.Ac),
+        "fc": float(params.fc),
+    }
+    base.update(kwargs)
+    # Stable ordering
+    return tuple(sorted(base.items()))
+
+if mode in ("Digital → Digital", "Digital → Analog"):
+    with st.sidebar:
+        st.subheader("Digital input")
+        default_bits = "10110010"
+
+        # Applied value (used by simulation)
+        if "bitstr" not in st.session_state:
+            st.session_state["bitstr"] = default_bits
+
+        # Draft value (what user edits)
+        if "bitstr_draft" not in st.session_state:
+            st.session_state["bitstr_draft"] = st.session_state["bitstr"]
+
+        st.text_input("Bitstring (required)", key="bitstr_draft")
+
+        # Validate bitstring and show the message under the input (sidebar)
+        _tmp = st.session_state.get("bitstr_draft", "").strip()
+        if _tmp == "":
+            st.error("Bitstring is required.")
+        else:
+            bad = [ch for ch in _tmp if ch not in "01"]
+            if bad:
+                st.error("Bitstring must contain only 0 and 1.")
+
+        st.slider("Random bits N", 8, 256, 32, step=8, key="rand_n")
+        st.text_input("Seed (optional)", value="", key="rand_seed")
+
+        # Validate seed (optional): must be integer if provided
+        seed_txt = st.session_state.get("rand_seed", "").strip()
+        seed_invalid = False
+        if seed_txt != "":
+            if seed_txt == "-" or not seed_txt.lstrip("-").isdigit():
+                seed_invalid = True
+                st.error("Seed must be an integer.")
+        
+        def _gen_bits_cb():
+            seed_txt = st.session_state.get("rand_seed", "").strip()
+            if seed_txt != "":
+                if seed_txt == "-" or not seed_txt.lstrip("-").isdigit():
+                    return  # invalid seed -> do nothing (sidebar error already shown)
+                s = int(seed_txt)
+            else:
+                s = None
+            n = int(st.session_state.get("rand_n", 32))
+            st.session_state["bitstr_draft"] = bits_to_string(gen_random_bits(n, seed=s))
+
+        st.button("Generate random bits", on_click=_gen_bits_cb)
+
+    # Always read the current bitstring from session_state
+    bitstr = st.session_state["bitstr"].strip()
+
+    bitstr_draft = st.session_state.get("bitstr_draft", "").strip()
+    draft_invalid = (bitstr_draft == "") or any(ch not in "01" for ch in bitstr_draft)
+
+    bits = None
+    bitstr_invalid = False
+
+    try:
+        bits = bits_from_string(bitstr)
+    except Exception:
+        bitstr_invalid = True
+
+if mode == "Digital → Digital":
+    with st.sidebar:
+        st.subheader("Technique")
+        line_amp = st.slider("Line amplitude (±A)", 1.0, 10.0, 1.0, step=0.5, key="d2d_line_amp")
+        st.session_state.pop("d2d_scheme", None)
+
+        base_scheme = st.selectbox(
+            "Encoding Algorithm",
+            ["NRZ-L", "NRZI", "Manchester", "Differential Manchester", "Bipolar-AMI", "Pseudoternary"],
+            key="d2d_base_scheme",
+        )
+
+        # Scrambling selector only for AMI
+        if base_scheme == "Bipolar-AMI":
+            scramble = st.selectbox(
+                "Scrambling Technique",
+                ["None", "B8ZS", "HDB3"],
+                key="d2d_scramble",
+            )
+            scheme = "Bipolar-AMI" if scramble == "None" else scramble
+        else:
+            scheme = base_scheme
+
+        nrzi_start_level = -1
+        diff_start_level = +1.0
+        last_pulse_init = -1
+        last_zero_pulse_init = -1
+
+        # For NRZ-L / Manchester: initial display level before first bit (to show or not show a transition at t=0)
+        nrzl_prev_level = +1          # +A means previous level was "high"
+        manchester_prev_bit = 1       # assumed bit value immediately before the sequence starts (0 or 1)
+
+        if scheme == "NRZ-L":
+            opt = st.selectbox("Assumed level BEFORE first bit", ["High (+A)", "Low (-A)"], index=0, key="d2d_nrzl_prev")
+            nrzl_prev_level = +1 if opt.startswith("High") else -1
+
+        if scheme == "NRZI":
+            opt = st.selectbox("Assumed level BEFORE first bit", ["Low (-A)", "High (+A)"], index=0, key="d2d_nrzi_prev")
+            nrzi_start_level = -1 if opt.startswith("Low") else +1
+
+        if scheme == "Manchester":
+            opt = st.selectbox("Assumed preceding bit (affects transition at t=0)", ["1", "0"], index=0, key="d2d_manch_prevbit")
+            manchester_prev_bit = 1 if opt == "1" else 0
+
+        if scheme == "Differential Manchester":
+            opt = st.selectbox("Assumed level BEFORE first bit", ["High (+A)", "Low (-A)"], index=0, key="d2d_diffman_prev")
+            diff_start_level = +1.0 if opt.startswith("High") else -1.0
+
+        if scheme == "Pseudoternary":
+            opt = st.selectbox("Most recent preceding '0' polarity", ["Negative (-A)", "Positive (+A)"], index=0, key="d2d_pseudo_last0")
+            last_zero_pulse_init = -1 if opt.startswith("Negative") else +1
+
+        hdb3_nonzero_since_violation_init = 0  # 0=even, 1=odd
+
+        if scheme in ("Bipolar-AMI", "B8ZS"):
+            opt = st.selectbox("Most recent preceding '1' polarity", ["Negative (-A)", "Positive (+A)"], index=0, key="d2d_ami_last1")
+            last_pulse_init = -1 if opt.startswith("Negative") else +1
+
+        if scheme == "HDB3":
+            opt1 = st.selectbox("Polarity of preceding pulse", ["Negative (-A)", "Positive (+A)"], index=0, key="d2d_hdb3_lastpulse")
+            last_pulse_init = -1 if opt1.startswith("Negative") else +1
+
+            opt2 = st.selectbox("Bipolar pulses since last substitution", ["Even", "Odd"], index=0, key="d2d_hdb3_parity")
+            hdb3_nonzero_since_violation_init = 0 if opt2 == "Even" else 1
+
+        current_sig = make_signature(
+            "d2d", params,
+            bitstr=bitstr,
+            scheme=scheme,
+            nrzi_start_level=int(nrzi_start_level),
+            diff_start_level=float(diff_start_level),
+            last_pulse_init=int(last_pulse_init),
+            last_zero_pulse_init=int(last_zero_pulse_init),
+            hdb3_nonzero_since_violation_init=int(hdb3_nonzero_since_violation_init),
+        )
+
+        compare_mode = st.checkbox("Compare mode (show multiple)", value=False, key="d2d_compare")
+        run = st.button(
+            "Run simulation",
+            type="primary",
+            key="d2d_run",
+            disabled=(draft_invalid or seed_invalid),
+        )
+
+        # Auto-run if live and signature changed (or never ran before)
+        if "d2d_last" not in st.session_state:
+            st.session_state["d2d_last"] = None
+        if "d2d_sig" not in st.session_state:
+            st.session_state["d2d_sig"] = None
+
+        live = True # always live for d2d
+
+        prev_sig = st.session_state.get("d2d_sig", None)
+
+        # If the user is editing a new bitstring draft (not yet applied), don't auto-rerun.
+        draft_dirty = st.session_state.get("bitstr_draft", "").strip() != st.session_state.get("bitstr", "").strip()
+
+        should_run = bool(run) or (live and (prev_sig is not None) and (prev_sig != current_sig) and (not draft_dirty))
+
+        if should_run and (not seed_invalid):
+            # Apply the draft bitstring ONLY when user clicks Run
+            if run and (not draft_invalid):
+                st.session_state["bitstr"] = st.session_state["bitstr_draft"].strip()
+
+            # Use the applied bitstring for the actual simulation
+            bitstr_run = st.session_state["bitstr"].strip()
+            bits_run = bits_from_string(bitstr_run)
+
+            # Recompute signature based on the applied bitstring
+            current_sig = make_signature(
+                "d2d", params,
+                bitstr=bitstr_run,
+                scheme=scheme,
+                nrzi_start_level=int(nrzi_start_level),
+                diff_start_level=float(diff_start_level),
+                last_pulse_init=int(last_pulse_init),
+                last_zero_pulse_init=int(last_zero_pulse_init),
+                hdb3_nonzero_since_violation_init=int(hdb3_nonzero_since_violation_init),
+            )
+
+            st.session_state["d2d_last"] = simulate_d2d(
+                bits_run, scheme, params,
+                nrzi_start_level=nrzi_start_level,
+                diff_start_level=diff_start_level,
+                last_pulse_init=last_pulse_init,
+                last_zero_pulse_init=last_zero_pulse_init,
+                hdb3_nonzero_since_violation_init=hdb3_nonzero_since_violation_init,
+            )
+            st.session_state["d2d_sig"] = current_sig
+
+    res = st.session_state.get("d2d_last", None)
+
+    if res is None:
+        empty_state()
+    else:
+        summary_block({**res.meta, "fs": params.fs, "Tb": params.Tb, "samples_per_bit": params.samples_per_bit})
+
+        tab_wave, tab_steps, tab_details, tab_theory = st.tabs(["Waveforms", "Steps", "Details", "Theory"])
+
+        with tab_wave:
+            tx_scaled = res.signals["tx"] * line_amp
+            t_to_plot = res.t
+            tx_to_plot = tx_scaled
+
+            if scheme == "NRZ-L":
+                init_level = nrzl_prev_level * line_amp
+                t_to_plot = np.concatenate([[0.0], t_to_plot])
+                tx_to_plot = np.concatenate([[init_level], tx_to_plot])
+
+            if scheme == "NRZI":
+                init_level = nrzi_start_level * line_amp
+                t_to_plot = np.concatenate([[0.0], t_to_plot])          # duplicate t=0
+                tx_to_plot = np.concatenate([[init_level], tx_to_plot]) # different y at same x => vertical line
+
+            if scheme == "Manchester":
+                prev_end_level = (+1 if manchester_prev_bit == 1 else -1)  # end level of preceding bit
+                init_level = prev_end_level * line_amp
+                t_to_plot = np.concatenate([[0.0], t_to_plot])
+                tx_to_plot = np.concatenate([[init_level], tx_to_plot])
+            
+            if scheme == "Differential Manchester":
+                init_level = diff_start_level * line_amp
+                t_to_plot = np.concatenate([[0.0], t_to_plot])
+                tx_to_plot = np.concatenate([[init_level], tx_to_plot])
+
+            # Input bits as step
+            inp = res.bits["input"]
+            t_bits = np.arange(len(inp)*Ns) / params.fs
+            x_bits = bits_to_step(inp, Ns)
+            st.plotly_chart(plot_signal(t_bits, x_bits, "Input bits (0/1)", grid=show_grid, step=True, x_dtick=params.Tb, y_dtick=1), width='stretch')
+
+            st.plotly_chart(plot_signal(t_to_plot, tx_to_plot, f"Encoded waveform ({scheme})", grid=show_grid, x_dtick=params.Tb, y_dtick=1), width='stretch')
+
+            dec = res.bits["decoded"]
+            t_dec = np.arange(len(dec)*Ns) / params.fs
+            x_dec = bits_to_step(dec, Ns)
+            st.plotly_chart(plot_signal(t_dec, x_dec, "Decoded bits (0/1)", grid=show_grid, step=True, x_dtick=params.Tb, y_dtick=1), width='stretch')
+
+            if compare_mode:
+                st.info("Compare mode: ON → showing all schemes with the same input bits.")
+                cols = st.columns(2)
+
+                def _prep_plot(s: str, t: np.ndarray, tx_scaled: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                    # Apply the SAME “assumption visualization” rules used by the main Encoded waveform
+                    t2 = t
+                    x2 = tx_scaled
+
+                    if s == "NRZ-L":
+                        init_level = nrzl_prev_level * line_amp
+                        t2 = np.concatenate([[0.0], t2])
+                        x2 = np.concatenate([[init_level], x2])
+
+                    if s == "NRZI":
+                        init_level = nrzi_start_level * line_amp
+                        t2 = np.concatenate([[0.0], t2])
+                        x2 = np.concatenate([[init_level], x2])
+
+                    if s == "Manchester":
+                        prev_end_level = (+1 if manchester_prev_bit == 1 else -1)
+                        init_level = prev_end_level * line_amp
+                        t2 = np.concatenate([[0.0], t2])
+                        x2 = np.concatenate([[init_level], x2])
+
+                    if s == "Differential Manchester":
+                        init_level = diff_start_level * line_amp
+                        t2 = np.concatenate([[0.0], t2])
+                        x2 = np.concatenate([[init_level], x2])
+
+                    return t2, x2
+                
+                def _assumption_note_for_compare(s: str) -> str | None:
+                    # Show notes only for plots that are NOT the currently selected scheme
+                    if s == scheme:
+                        return None
+
+                    amp = f"{line_amp:g}"  # show numeric amplitude cleanly
+
+                    if s == "NRZ-L":
+                        lvl = "High" if nrzl_prev_level > 0 else "Low"
+                        sign = "+" if nrzl_prev_level > 0 else "-"
+                        return f"Assumed level BEFORE first bit: {lvl} ({sign}{amp})"
+
+                    if s == "NRZI":
+                        lvl = "High" if nrzi_start_level > 0 else "Low"
+                        sign = "+" if nrzi_start_level > 0 else "-"
+                        return f"Assumed level BEFORE first bit: {lvl} ({sign}{amp})"
+
+                    if s == "Manchester":
+                        return f"Assumed preceding bit: {manchester_prev_bit}"
+
+                    if s == "Differential Manchester":
+                        lvl = "High" if diff_start_level > 0 else "Low"
+                        sign = "+" if diff_start_level > 0 else "-"
+                        return f"Assumed level BEFORE first bit: {lvl} ({sign}{amp})"
+
+                    if s == "Bipolar-AMI":
+                        pol = "Positive" if last_pulse_init > 0 else "Negative"
+                        sign = "+" if last_pulse_init > 0 else "-"
+                        return f"Assumed most recent preceding '1' polarity: {pol} ({sign}{amp})"
+
+                    if s == "Pseudoternary":
+                        pol = "Positive" if last_zero_pulse_init > 0 else "Negative"
+                        sign = "+" if last_zero_pulse_init > 0 else "-"
+                        return f"Assumed most recent preceding '0' polarity: {pol} ({sign}{amp})"
+
+                    return None
+
+                for idx, s2 in enumerate(["NRZ-L", "NRZI", "Manchester", "Differential Manchester", "Bipolar-AMI", "Pseudoternary"]):
+                    # IMPORTANT: pass the SAME init params so AMI/Pseudoternary/NRZI/DiffMan match the main plot
+                    r2 = simulate_d2d(
+                        res.bits["input"], s2, params,
+                        nrzi_start_level=nrzi_start_level,
+                        diff_start_level=diff_start_level,
+                        last_pulse_init=last_pulse_init,
+                        last_zero_pulse_init=last_zero_pulse_init,
+                        hdb3_nonzero_since_violation_init=hdb3_nonzero_since_violation_init,
+                    )
+
+                    tx2 = r2.signals["tx"] * line_amp
+                    t2, tx2 = _prep_plot(s2, r2.t, tx2)
+
+                    with cols[idx % 2]:
+                        note = _assumption_note_for_compare(s2)
+                        if note:
+                            title = f"{s2}  <span style='font-size:0.80em; opacity:0.8'>'{note}'</span>"
+                        else:
+                            title = f"{s2}"
+
+                        st.plotly_chart(
+                            plot_signal(t2, tx2, title, grid=show_grid, x_dtick=params.Tb, y_dtick=1),
+                            width="stretch",
+                        )
+
+        with tab_steps:
+            def _scale_meta_for_display(meta_obj: dict, amp: float) -> dict:
+                # Make a deep-ish copy and scale any ternary patterns (+/-1/0) to +/-amp/0 for display
+                if not isinstance(meta_obj, dict):
+                    return meta_obj
+                m = dict(meta_obj)
+
+                # scale substitutions patterns if present
+                subs = m.get("substitutions", None)
+                if isinstance(subs, list):
+                    new_subs = []
+                    for s in subs:
+                        s2 = dict(s)
+                        if "pattern" in s2 and isinstance(s2["pattern"], list):
+                            s2["pattern"] = [float(v) * float(amp) for v in s2["pattern"]]
+                        # if you stored last_pulse polarity, show scaled too (optional)
+                        if "last_pulse" in s2 and isinstance(s2["last_pulse"], (int, float)):
+                            s2["last_pulse"] = float(s2["last_pulse"]) * float(amp)
+                        if "last_pulse_before" in s2 and isinstance(s2["last_pulse_before"], (int, float)):
+                            s2["last_pulse_before"] = float(s2["last_pulse_before"]) * float(amp)
+                        # make common numeric fields floats so Streamlit JSON colors them consistently
+                        for k in ("pos", "count_since_last_sub"):
+                            if k in s2 and isinstance(s2[k], (int, float)):
+                                s2[k] = int(s2[k])
+                        new_subs.append(s2)
+                    m["substitutions"] = new_subs
+
+                # scale decoder hits windows if present
+                hits = m.get("descramble_hits", None)
+                if isinstance(hits, list):
+                    new_hits = []
+                    for h in hits:
+                        h2 = dict(h)
+                        if "chunk" in h2 and isinstance(h2["chunk"], list):
+                            h2["chunk"] = [float(v) * float(amp) for v in h2["chunk"]]
+                        if "window" in h2 and isinstance(h2["window"], list):
+                            h2["window"] = [float(v) * float(amp) for v in h2["window"]]
+                        if "last_pulse" in h2 and isinstance(h2["last_pulse"], (int, float)):
+                            h2["last_pulse"] = float(h2["last_pulse"]) * float(amp)
+                        if "last_nonzero" in h2 and isinstance(h2["last_nonzero"], (int, float)):
+                            h2["last_nonzero"] = float(h2["last_nonzero"]) * float(amp)
+                        # make common numeric fields floats for consistent coloring
+                        for k in ("pos", "v", "b"):
+                            if k in h2 and isinstance(h2[k], (int, float)):
+                                h2[k] = int(h2[k])
+
+                        new_hits.append(h2)
+                    m["descramble_hits"] = new_hits
+
+                m["display_amplitude"] = f"{float(amp):.2f}"
+                return m
+
+            enc = _scale_meta_for_display(res.meta.get("encode", {}), line_amp)
+            dec = _scale_meta_for_display(res.meta.get("decode", {}), line_amp)
+
+            # Pull out the nested lists so they don't ruin the pretty table
+            enc_subs = enc.pop("substitutions", None)
+            dec_hits = dec.pop("descramble_hits", None)
+
+            st.write("Encoder meta:")
+            dict_to_pretty_table(enc, width=700)
+
+            if isinstance(enc_subs, list):
+                with st.expander("Encoder substitutions", expanded=True):
+                    render_events_table(enc_subs, width=1000)
+
+            st.write("Decoder meta:")
+            dict_to_pretty_table(dec, width=700)
+
+            if isinstance(dec_hits, list):
+                with st.expander("Decoder descramble hits", expanded=True):
+                    render_events_table(dec_hits, width=1000)
+
+        with tab_details:
+            st.write("Input bits:")
+            st.code(bits_to_string(res.bits["input"]))
+            st.write("Decoded bits:")
+            st.code(bits_to_string(res.bits["decoded"]))
+            st.write("Match:")
+            if res.meta["match"]:
+                st.success("MATCH")
+            else:
+                st.error("MISMATCH")
+
+        with tab_theory:
+            render_d2d_theory(
+                params=params,
+                line_amp=line_amp,
+                show_grid=show_grid,
+                nrzl_prev_level=nrzl_prev_level,
+                nrzi_start_level=nrzi_start_level,
+                manchester_prev_bit=manchester_prev_bit,
+                diff_start_level=diff_start_level,
+                last_pulse_init=last_pulse_init,
+                last_zero_pulse_init=last_zero_pulse_init,
+                hdb3_nonzero_since_violation_init=hdb3_nonzero_since_violation_init,
+            )
+
+
+elif mode == "Digital → Analog":
+    with st.sidebar:
+        st.subheader("Technique")
+        label = st.selectbox("Modulation Technique", ["ASK", "BFSK", "MFSK", "BPSK", "DPSK", "QPSK", "QAM"])
+        scheme = label
+
+        st.subheader("Technique parameters")
+        kwargs = {}
+        invalid_params = False
+
+        if scheme == "ASK":
+            A0 = st.slider("A0", 0.0, 1.0, 0.0, step=0.05)
+            A1 = st.slider("A1", 0.1, 2.0, 1.0, step=0.1)
+            kwargs["A0"] = A0
+            kwargs["A1"] = A1
+
+            # Disallow ambiguous ASK (no amplitude difference)
+            if np.isclose(A0, A1):
+                st.error("Invalid ASK: A0 and A1 cannot be equal (no amplitude difference to detect).")
+                invalid_params = True
+
+        if scheme == "BFSK":
+            nyq = float(params.fs) / 2.0
+        
+            # Max symmetric deviation so both tones stay within (0, Nyquist)
+            dev_max = min(fc - 0.1, nyq - fc - 0.1)
+        
+            if dev_max <= 0:
+                st.error("BFSK invalid: fc is too close to 0 or Nyquist for any symmetric tones.")
+                invalid_params = True
+                dev_max = 0.1  # avoid crashing the UI
+        
+            f0_min = float(fc - dev_max)
+            f0_max = float(fc)
+            f1_min = float(fc)
+            f1_max = float(fc + dev_max)
+        
+            # Initialize state once
+            if "bfsk_dev" not in st.session_state:
+                st.session_state["bfsk_dev"] = float(min(2.0 / Tb, 0.8 * dev_max)) if dev_max > 0 else 0.5
+        
+            if "bfsk_f0" not in st.session_state or "bfsk_f1" not in st.session_state:
+                d = float(st.session_state["bfsk_dev"])
+                d = float(np.clip(d, 0.0, dev_max))
+                st.session_state["bfsk_f0"] = float(fc - d)
+                st.session_state["bfsk_f1"] = float(fc + d)
+        
+            # Clamp existing values to new ranges whenever fc/fs/Tb changes
+            st.session_state["bfsk_f0"] = float(np.clip(float(st.session_state["bfsk_f0"]), f0_min, f0_max))
+            st.session_state["bfsk_f1"] = float(np.clip(float(st.session_state["bfsk_f1"]), f1_min, f1_max))
+        
+            # Force symmetry around fc using the larger deviation of the two
+            d0 = float(fc - st.session_state["bfsk_f0"])
+            d1 = float(st.session_state["bfsk_f1"] - fc)
+            d = float(np.clip(max(d0, d1), 0.0, dev_max))
+            st.session_state["bfsk_dev"] = d
+            st.session_state["bfsk_f0"] = float(fc - d)
+            st.session_state["bfsk_f1"] = float(fc + d)
+        
+            def _sync_from_f0_slider():
+                f0 = float(st.session_state["bfsk_f0"])
+                d = float(np.clip(fc - f0, 0.0, dev_max))
+                st.session_state["bfsk_dev"] = d
+                st.session_state["bfsk_f0"] = float(fc - d)
+                st.session_state["bfsk_f1"] = float(fc + d)
+        
+            def _sync_from_f1_slider():
+                f1 = float(st.session_state["bfsk_f1"])
+                d = float(np.clip(f1 - fc, 0.0, dev_max))
+                st.session_state["bfsk_dev"] = d
+                st.session_state["bfsk_f0"] = float(fc - d)
+                st.session_state["bfsk_f1"] = float(fc + d)
+        
+            st.markdown(
+                "<div style='font-size:0.85rem; opacity:0.75; margin-bottom:1rem;'>"
+                "Book convention:<br/>f0 = fc − Δf and f1 = fc + Δf , |Δf| ≠ 0"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+            st.slider(
+                "f0 (Hz) for binary 0",
+                min_value=f0_min,
+                max_value=f0_max,
+                step=0.1,
+                key="bfsk_f0",
+                on_change=_sync_from_f0_slider,
+            )
+        
+            st.slider(
+                "f1 (Hz) for binary 1",
+                min_value=f1_min,
+                max_value=f1_max,
+                step=0.1,
+                key="bfsk_f1",
+                on_change=_sync_from_f1_slider,
+            )
+        
+            st.text_input(
+                "Derived deviation Δf (Hz)",
+                value=f"{float(st.session_state['bfsk_dev']):.6g}",
+                disabled=True,
+            )
+        
+            kwargs["f0"] = float(st.session_state["bfsk_f0"])
+            kwargs["f1"] = float(st.session_state["bfsk_f1"])
+        
+            if np.isclose(kwargs["f0"], kwargs["f1"]):
+                st.error("Invalid BFSK: f0 and f1 cannot be equal.")
+                invalid_params = True
+
+        if scheme == "MFSK":
+            nyq = float(params.fs) / 2.0
+
+            L = st.select_slider("Bits per symbol (L)", options=[2, 3, 4], value=2)
+            M = 2 ** int(L)
+            st.text_input("Derived number of tones M = 2^L", value=str(M), disabled=True)
+
+            # Keep all tones within (0, Nyquist): fc ± (M-1)*fd
+            fd_max = min((fc - 0.1) / (M - 1), (nyq - fc - 0.1) / (M - 1))
+            if fd_max <= 0:
+                st.error("MFSK invalid: fc is too close to 0 or Nyquist for the selected M.")
+                invalid_params = True
+                fd_max = 0.1
+
+            fd_default = min(1.0 / Tb, 0.5 * fd_max)
+
+            fd = st.slider("Frequency difference fd (Hz)", 0.1, float(fd_max), float(fd_default), step=0.1)
+
+            # Show the tone set
+            freqs = [fc + (2 * (i + 1) - 1 - M) * fd for i in range(M)]
+            with st.expander("MFSK tone frequencies"):
+                rows = [{"bits": format(i, f"0{int(L)}b"), "f_i (Hz)": f"{float(f):.2f}"} for i, f in enumerate(freqs)]
+                render_events_table(rows, width=700)
+
+            kwargs["L"] = int(L)
+            kwargs["fd"] = float(fd)
+
+        if scheme == "BPSK":
+            preset = st.selectbox(
+                "BPSK configuration",
+                ["Standard (0, π)", "Offset (φ, φ+π)", "Custom (φ1, φ0)"],
+                index=0,
+            )
+
+            if preset == "Standard (0, π)":
+                phase1 = 0.0
+                phase0 = float(np.pi)
+
+            elif preset == "Offset (φ, φ+π)":
+                phi = st.slider(
+                    "Reference phase φ (rad)",
+                    float(-np.pi),
+                    float(np.pi),
+                    0.0,
+                    step=0.01,
+                )
+                phase1 = float(phi)
+                phase0 = float(((phi + np.pi) + np.pi) % (2 * np.pi) - np.pi)
+
+            else:  # Custom
+                phase1 = st.slider(
+                    "Phase of binary 1, φ1 (rad)",
+                    float(-np.pi),
+                    float(np.pi),
+                    0.0,
+                    step=0.01,
+                )
+                phase0 = st.slider(
+                    "Phase of binary 0, φ0 (rad)",
+                    float(-np.pi),
+                    float(np.pi),
+                    float(np.pi),
+                    step=0.01,
+                )
+            kwargs["phase1"] = float(phase1)
+            kwargs["phase0"] = float(phase0)
+
+            # Derived values table (always shown)
+            dphi = (float(phase0) - float(phase1) + np.pi) % (2 * np.pi) - np.pi
+
+            abs_sep = abs((float(phase0) - float(phase1) + np.pi) % (2*np.pi) - np.pi)
+
+            if abs_sep < 0.10:  # choose threshold (e.g., 0.10 rad ≈ 5.7°)
+                st.error("Invalid BPSK: φ0 and φ1 are too close → symbols become indistinguishable.")
+                invalid_params = True
+
+            rows = [
+                {"Item": "Bit 1 phase φ1", "Value": f"{float(phase1):.2f} rad"},
+                {"Item": "Bit 0 phase φ0", "Value": f"{float(phase0):.2f} rad"},
+                {"Item": "Phase separation |Δφ| = |φ0-φ1|", "Value": f"{abs(float(dphi)):.2f} rad"},
+                {"Item": "Antipodal? (|Δφ| = π)", "Value": str(bool(np.isclose(abs(dphi), np.pi, atol=1e-2)))},
+            ]
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df,
+                width='stretch',
+                hide_index=True,
+                column_config={
+                    "Item": st.column_config.TextColumn("Item", width="medium"),
+                    "Value": st.column_config.TextColumn("Value", width="small"),
+                },
+            )
+
+        if scheme == "DPSK":
+            phase_init = st.slider(
+                "Reference phase (initial) φ_ref (rad)",
+                float(-np.pi),
+                float(np.pi),
+                0.0,
+                step=0.01,
+            )
+
+            kwargs["phase_init"] = float(phase_init)
+            kwargs["delta_phase"] = float(np.pi)  # fixed per textbook DPSK
+
+            rows = [
+                {"Item": "Reference phase φ_ref", "Value": f"{float(phase_init):.2f} rad"},
+                {"Item": "Bit-1 phase change Δφ", "Value": f"{float(np.pi):.2f} rad"},
+                {"Item": "Bit-0 phase change", "Value": "0.00 rad"},
+            ]
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df,
+                width='stretch',
+                hide_index=True,
+                column_config={
+                    "Item": st.column_config.TextColumn("Item", width="medium"),
+                    "Value": st.column_config.TextColumn("Value", width="small"),
+                },
+            )
+        
+        if scheme == "QPSK":
+            phi_ref = st.slider(
+                "Constellation rotation φ_ref (rad)",
+                float(-np.pi),
+                float(np.pi),
+                0.0,      # IMPORTANT: default 0 keeps book phases exactly (±π/4, ±3π/4)
+                step=0.01,
+            )
+            kwargs["phi_ref"] = float(phi_ref)
+
+            # Table: bits -> (I,Q) -> phase = φ_ref + atan2(Q,I)
+            entries = [
+                {"Bits": "11", "I": +1, "Q": +1},
+                {"Bits": "01", "I": -1, "Q": +1},
+                {"Bits": "00", "I": -1, "Q": -1},
+                {"Bits": "10", "I": +1, "Q": -1},
+            ]
+            rows = []
+            for e in entries:
+                I = float(e["I"])
+                Q = float(e["Q"])
+                phase = float(phi_ref + np.arctan2(Q, I))
+                # wrap to (-pi, pi] for nicer display
+                phase = (phase + np.pi) % (2 * np.pi) - np.pi
+                rows.append({
+                    "Bits": e["Bits"],
+                    "I level": f"{I:.0f}",
+                    "Q level": f"{Q:.0f}",
+                    "Phase": f"{phase:.2f} ≈ {phase_as_pi_frac(phase)} rad",
+                })
+
+            st.markdown(
+                "<div style='font-size:0.85rem; opacity:0.75; margin-top:0.25rem;'>"
+                "Book mapping (Eq. 5.7) is obtained when φ_ref = 0."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df,
+                width='stretch',
+                hide_index=True,
+                column_config={
+                    "Bits": st.column_config.TextColumn("Bits", width="small"),
+                    "I level": st.column_config.TextColumn("I level", width="small"),
+                    "Q level": st.column_config.TextColumn("Q level", width="small"),
+                    "Phase": st.column_config.TextColumn("Phase", width="medium"),
+                },
+            )
+
+        if scheme == "QAM":
+            qam_variant = st.radio(
+                "QAM variant",
+                ["2-level ASK (QAM)", "4-level ASK (16-QAM)"],
+                index=0,
+                horizontal=True,
+            )
+
+            axis_levels = 2 if qam_variant.startswith("2-level") else 4
+            kwargs["axis_levels"] = int(axis_levels)
+
+            phi_ref = st.slider(
+                "Constellation rotation φ_ref (rad)",
+                float(-np.pi),
+                float(np.pi),
+                0.0,
+                step=0.01,
+            )
+            kwargs["phi_ref"] = float(phi_ref)
+
+            st.markdown(
+                "<div style='font-size:0.85rem; opacity:0.75; margin-top:0.25rem;'>"
+                "Book form: s(t) = d1(t) cos(2πfct) + d2(t) sin(2πfct). "
+                "Input is split into I/Q streams by taking alternate bits."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+            if axis_levels == 2:
+                # 2-level: show 4 states (I,Q) in {-1,+1}
+                entries = [
+                    {"Bits (I,Q)": "00", "d1": -1, "d2": -1},
+                    {"Bits (I,Q)": "01", "d1": -1, "d2": +1},
+                    {"Bits (I,Q)": "10", "d1": +1, "d2": -1},
+                    {"Bits (I,Q)": "11", "d1": +1, "d2": +1},
+                ]
+                rows = []
+                for e in entries:
+                    d1 = float(e["d1"])
+                    d2 = float(e["d2"])
+                    phase = float(phi_ref + np.arctan2(d2, d1))
+                    phase = (phase + np.pi) % (2 * np.pi) - np.pi
+                    rows.append({
+                        "Bits (I,Q)": e["Bits (I,Q)"],
+                        "d1": f"{d1:.0f}",
+                        "d2": f"{d2:.0f}",
+                        "Phase": f"{phase:.2f} ≈ {phase_as_pi_frac(phase)} rad",
+                    })
+
+                df = pd.DataFrame(rows)
+                st.dataframe(
+                    df,
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "Bits (I,Q)": st.column_config.TextColumn("Bits (I,Q)", width="small"),
+                        "d1": st.column_config.TextColumn("d1", width="small"),
+                        "d2": st.column_config.TextColumn("d2", width="small"),
+                        "Phase": st.column_config.TextColumn("Phase", width="medium"),
+                    },
+                )
+
+            else:
+                # 16-QAM: show per-axis Gray mapping table (2 bits -> level)
+                axis_rows = [
+                    {"Axis bits": "00", "Level": "-3"},
+                    {"Axis bits": "01", "Level": "-1"},
+                    {"Axis bits": "11", "Level": "+1"},
+                    {"Axis bits": "10", "Level": "+3"},
+                ]
+                st.markdown(
+                    "<div style='font-size:0.85rem; opacity:0.75; margin-top:0.25rem;'>"
+                    "16-QAM uses 4 levels per axis (Gray). One symbol uses 4 input bits in book order: "
+                    "[I0, Q0, I1, Q1]. (I stream = 1st,3rd,5th,... bits; Q stream = 2nd,4th,6th,... bits.)"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                df = pd.DataFrame(axis_rows)
+                st.dataframe(
+                    df,
+                    width='stretch',
+                    hide_index=True,
+                    column_config={
+                        "Axis bits": st.column_config.TextColumn("Axis bits", width="small"),
+                        "Level": st.column_config.TextColumn("Level", width="small"),
+                    },
+                )
+
+        current_sig = make_signature(
+            "d2a", params,
+            bitstr=st.session_state["bitstr"].strip(),
+            scheme=scheme,
+            kwargs=tuple(sorted((k, float(v)) for k, v in kwargs.items())),
+        )
+
+        compare_mode = st.checkbox("Compare mode (show multiple)", value=False, key="d2a_compare")
+
+        run = st.button(
+            "Run simulation",
+            type="primary",
+            disabled=(invalid_params or draft_invalid or seed_invalid),
+        )
+
+    # --- D2A run state (aligned with D2D) ---
+    if "d2a_last" not in st.session_state:
+        st.session_state["d2a_last"] = None
+    if "d2a_sig" not in st.session_state:
+        st.session_state["d2a_sig"] = None
+    
+    live = True  # same idea as D2D: auto-update after first run when params change
+    prev_sig = st.session_state.get("d2a_sig", None)
+    
+    # Don't auto-rerun while user is typing a new (not applied) bitstring draft
+    draft_dirty = st.session_state.get("bitstr_draft", "").strip() != st.session_state.get("bitstr", "").strip()
+    
+    should_run = bool(run) or (live and (prev_sig is not None) and (prev_sig != current_sig) and (not draft_dirty))
+    
+    if should_run and (not seed_invalid) and (not invalid_params):
+        # Apply draft -> applied ONLY when user clicks Run
+        if run and (not draft_invalid):
+            st.session_state["bitstr"] = st.session_state["bitstr_draft"].strip()
+    
+        bitstr_run = st.session_state["bitstr"].strip()
+        bits_run = bits_from_string(bitstr_run)
+    
+        # Recompute sig based on what we actually ran
+        current_sig = make_signature(
+            "d2a", params,
+            bitstr=bitstr_run,
+            scheme=scheme,
+            kwargs=tuple(sorted((k, float(v)) for k, v in kwargs.items())),
+        )
+    
+        st.session_state["d2a_last"] = simulate_d2a(bits_run, scheme, params, **kwargs)
+        st.session_state["d2a_sig"] = current_sig
+    
+    res = st.session_state.get("d2a_last", None)
+    
+    if res is None:
+        empty_state()
+    else:
+        summary_block({**res.meta, "fs": params.fs, "fc": params.fc, "Tb": params.Tb, "samples_per_bit": params.samples_per_bit})
+
+        tab_wave, tab_steps, tab_details, tab_theory = st.tabs(["Waveforms", "Steps", "Details", "Theory"])
+
+        with tab_wave:
+            inp = res.bits["input"]
+            t_bits = np.arange(len(inp)*Ns) / params.fs
+            x_bits = bits_to_step(inp, Ns)
+            st.plotly_chart(plot_signal(t_bits, x_bits, "Input bits (0/1)", grid=show_grid, step=True, x_dtick=params.Tb, y_dtick=1), width='stretch')
+            st.plotly_chart(plot_signal(res.t, res.signals["tx"], f"Modulated signal ({scheme})", grid=show_grid, x_dtick=params.Tb, y_dtick=1), width='stretch')
+
+            dec = res.bits["decoded"]
+            t_dec = np.arange(len(dec)*Ns) / params.fs
+            x_dec = bits_to_step(dec, Ns)
+            st.plotly_chart(plot_signal(t_dec, x_dec, "Recovered bits (0/1)", grid=show_grid, step=True, x_dtick=params.Tb, y_dtick=1), width='stretch')
+
+            # --- Compare mode (D2A) ---
+            if compare_mode:
+                st.info("Compare mode: ON → showing all modulation techniques with the same input bits.")
+
+                cols = st.columns(2)
+
+                # Identify the currently selected “plot” (QAM has 2 variants)
+                cur_axis_levels = None
+                if scheme == "QAM" and "axis_levels" in kwargs:
+                    try:
+                        cur_axis_levels = int(kwargs["axis_levels"])
+                    except Exception:
+                        cur_axis_levels = None
+
+                compare_items = [
+                    {
+                        "key": "ASK",
+                        "title": "ASK",
+                        "scheme": "ASK",
+                        "defaults": {"A0": 0.00, "A1": 1.00},
+                        "note": "A0 = 0.00, A1 = 1.00",
+                    },
+                    {
+                        "key": "BFSK",
+                        "title": "BFSK",
+                        "scheme": "BFSK",
+                        "defaults": {"f0": 8.00, "f1": 12.00},
+                        "note": "f0 = 8.00 Hz, f1 = 12.00 Hz",
+                    },
+                    {
+                        "key": "MFSK",
+                        "title": "MFSK",
+                        "scheme": "MFSK",
+                        "defaults": {"L": 2, "fd": 1.00},
+                        "note": "L = 2 (M = 4), fd = 1.00 Hz",
+                    },
+                    {
+                        "key": "BPSK_STD",
+                        "title": "BPSK",
+                        "scheme": "BPSK",
+                        "defaults": {"phase1": 0.0, "phase0": float(np.pi)},
+                        "note": "Standard 'φ1 = 0.00 rad, φ0 = π rad'",
+                    },
+                    {
+                        "key": "DPSK",
+                        "title": "DPSK",
+                        "scheme": "DPSK",
+                        "defaults": {"phase_init": 0.0, "delta_phase": float(np.pi)},
+                        "note": "φ_ref = 0.00 rad, Δφ = π rad",
+                    },
+                    {
+                        "key": "QPSK",
+                        "title": "QPSK",
+                        "scheme": "QPSK",
+                        "defaults": {"phi_ref": 0.0},
+                        "note": "φ_ref = 0.00 rad",
+                    },
+                    {
+                        "key": "QAM2",
+                        "title": "QAM (2-level ASK)",
+                        "scheme": "QAM",
+                        "axis_levels": 2,
+                        "defaults": {"axis_levels": 2, "phi_ref": 0.0},
+                        "note": "2-level ASK (axis_levels = 2), φ_ref = 0.00 rad",
+                    },
+                    {
+                        "key": "QAM16",
+                        "title": "16-QAM (4-level ASK)",
+                        "scheme": "QAM",
+                        "axis_levels": 4,
+                        "defaults": {"axis_levels": 4, "phi_ref": 0.0},
+                        "note": "4-level ASK (axis_levels = 4), φ_ref = 0.00 rad",
+                    },
+                ]
+
+                def _is_selected(item: dict) -> bool:
+                    if item["scheme"] != scheme:
+                        return False
+                    if item["scheme"] != "QAM":
+                        return True
+                    # QAM: selection depends on axis_levels
+                    return cur_axis_levels is not None and cur_axis_levels == int(item.get("axis_levels", -1))
+
+                # Use the SAME input bits for all
+                bits_cmp = res.bits["input"]
+
+                for idx, item in enumerate(compare_items):
+                    selected = _is_selected(item)
+                    kwargs_use = dict(kwargs) if selected else dict(item["defaults"])
+
+                    # Simulate this scheme
+                    res2 = simulate_d2a(bits_cmp, item["scheme"], params, **kwargs_use)
+
+                    # Title + note (only for non-selected)
+                    if selected:
+                        title = item["title"]
+                    else:
+                        title = (
+                            f"{item['title']}  "
+                            f"<span style='font-size:0.80em; opacity:0.8'>({item['note']})</span>"
+                        )
+
+                    with cols[idx % 2]:
+                        st.plotly_chart(
+                            plot_signal(
+                                res2.t,
+                                res2.signals["tx"],
+                                title,
+                                grid=show_grid,
+                                x_dtick=params.Tb,
+                                y_dtick=1,
+                            ),
+                            width="stretch",
+                        )
+
+        with tab_steps:
+            dem = res.meta.get("demodulate", {})
+
+            if isinstance(dem, dict):
+                # 1) Make a copy so we can format without touching the original
+                dem2 = dict(dem)
+
+                # 2) ASK-specific formatting (safe even if the key isn't present)
+                if "A0" in dem2 and isinstance(dem2["A0"], (int, float, np.floating)):
+                    dem2["A0"] = f"{float(dem2['A0']):.2f}"
+                if "A1" in dem2 and isinstance(dem2["A1"], (int, float, np.floating)):
+                    dem2["A1"] = f"{float(dem2['A1']):.2f}"
+                if "thr" in dem2 and isinstance(dem2["thr"], (int, float, np.floating)):
+                    dem2["thr"] = f"{float(dem2['thr']):.3f}"  # good balance for threshold
+
+                # Pull A_hat out so it doesn't appear as one huge list in the main table
+                a_hat = dem2.pop("A_hat", None)
+                i_hat = dem2.pop("I_hat", None)
+                q_hat = dem2.pop("Q_hat", None)
+                i_dec = dem2.pop("I_dec", None)
+                q_dec = dem2.pop("Q_dec", None)
+                phi_hat = dem2.pop("phi_hat", None)
+                delta_hat = dem2.pop("delta_hat", None)
+                warnings_list = dem2.pop("warnings", None)
+                tone_sep = dem2.pop("tone_sep", None)
+                dem2.pop("E0", None)
+                dem2.pop("E1", None)
+
+                # MFSK: format fd to 2 decimals
+                if dem2.get("scheme") == "MFSK" and "fd" in dem2 and isinstance(dem2["fd"], (int, float, np.floating)):
+                    dem2["fd"] = f"{float(dem2['fd']):.2f}"
+
+                # MFSK: remove heavy lists from the main Steps table (keep internally in meta)
+                mfsk_freqs = None
+                mfsk_chosen = None
+                if dem2.get("scheme") == "MFSK":
+                    mfsk_freqs = dem2.pop("freqs", None)
+                    mfsk_chosen = dem2.pop("chosen_idx", None)
+                    dem2.pop("energies", None)  # hide from Steps tab only
+
+                # BFSK-specific formatting
+                if dem2.get("scheme") == "BFSK":
+                    for fk in ("f0", "f1"):
+                        if fk in dem2 and isinstance(dem2[fk], (int, float, np.floating)):
+                            dem2[fk] = f"{float(dem2[fk]):.2f}"
+
+                if dem2.get("scheme") == "BPSK":
+                    for pk in ("phase1", "phase0"):
+                        if pk in dem2 and isinstance(dem2[pk], (int, float, np.floating)):
+                            dem2[pk] = f"{float(dem2[pk]):.2f}"
+                    
+                if dem2.get("scheme") == "DPSK":
+                    for pk in ("phase_init", "delta_phase"):
+                        if pk in dem2 and isinstance(dem2[pk], (int, float, np.floating)):
+                            dem2[pk] = f"{float(dem2[pk]):.2f}"
+                
+                if dem2.get("scheme") == "QPSK":
+                    if "phi_ref" in dem2 and isinstance(dem2["phi_ref"], (int, float, np.floating)):
+                        dem2["phi_ref"] = f"{float(dem2['phi_ref']):.2f}"
+
+                if dem2.get("scheme") == "QAM":
+                    # show clean ints
+                    for ik in ("axis_levels", "bits_per_axis", "bits_per_symbol", "symbols"):
+                        if ik in dem2:
+                            try:
+                                dem2[ik] = int(dem2[ik])
+                            except Exception:
+                                pass
+                            
+                    # show clean floats
+                    for fk in ("phi_ref", "norm"):
+                        if fk in dem2 and isinstance(dem2[fk], (int, float, np.floating)):
+                            dem2[fk] = f"{float(dem2[fk]):.2f}"
+
+                # 3) Keep your existing “simple vs event list” logic
+                simple = {}
+                event_lists = {}
+                for k, v in dem2.items():
+                    if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                        event_lists[k] = v
+                    else:
+                        simple[k] = v
+
+                dict_to_pretty_table(simple, width=700)
+
+                # MFSK: show freqs and chosen_idx as separate tables
+                if isinstance(mfsk_freqs, list):
+                    with st.expander("freqs (tone set)", expanded=True):
+                        L_sym = int(dem.get("L", dem.get("bits_per_symbol", 1)))
+                        rows = [{"bits": format(i, f"0{L_sym}b"), "f_i (Hz)": f"{float(f):.2f}"} for i, f in enumerate(mfsk_freqs)]
+                        render_events_table(rows, width=900)
+
+                if isinstance(mfsk_chosen, list):
+                    with st.expander("chosen_idx (detected tone index per symbol)", expanded=True):
+                        L_sym = int(dem.get("L", dem.get("bits_per_symbol", 1)))
+                        rows = [
+                            {"symbol_index": i, "bits": format(int(idx), f"0{L_sym}b")}
+                            for i, idx in enumerate(mfsk_chosen)
+                        ]
+                        render_events_table(rows, width=900)
+
+                # --- Combined I/Q tables: hat vs dec (only when both exist) ---
+                bpsym = None
+                try:
+                    bpsym = int(dem.get("bits_per_symbol"))
+                except Exception:
+                    # Fallbacks for older schemes that may not store bits_per_symbol explicitly
+                    if dem2.get("scheme") == "16QAM":
+                        bpsym = 4
+                    elif dem2.get("scheme") == "QPSK":
+                        bpsym = 2
+                    else:
+                        bpsym = 1  # default: 1 estimate per bit
+
+                same_index = (bpsym == 1)
+
+                def _make_index_cols(sym_i: int) -> dict:
+                    if same_index:
+                        return {"bit_index / symbol_index": sym_i}
+                    # show both when they differ
+                    return {
+                        "symbol_index": sym_i,
+                        "bit_index_start": sym_i * bpsym,
+                    }
+
+                # I table
+                if isinstance(i_hat, list) and isinstance(i_dec, list):
+                    with st.expander("I: I_hat vs I_dec", expanded=True):
+                        n = min(len(i_hat), len(i_dec))
+                        rows = []
+                        for k in range(n):
+                            r = _make_index_cols(k)
+                            r["I_hat"] = f"{float(i_hat[k]):.2f}"
+                            r["I_dec"] = f"{float(i_dec[k]):.2f}"
+                            rows.append(r)
+                        render_events_table(rows, width=1000)
+
+                # Q table
+                if isinstance(q_hat, list) and isinstance(q_dec, list):
+                    with st.expander("Q: Q_hat vs Q_dec", expanded=True):
+                        n = min(len(q_hat), len(q_dec))
+                        rows = []
+                        for k in range(n):
+                            r = _make_index_cols(k)
+                            r["Q_hat"] = f"{float(q_hat[k]):.2f}"
+                            r["Q_dec"] = f"{float(q_dec[k]):.2f}"
+                            rows.append(r)
+                        render_events_table(rows, width=1000)
+
+                # For schemes that only have hat (no dec), keep a simple display
+                if isinstance(i_hat, list) and not isinstance(i_dec, list):
+                    with st.expander("I_hat", expanded=True):
+                        rows = [{"bit_index / symbol_index": i, "I_hat": f"{float(v):.2f}"} for i, v in enumerate(i_hat)]
+                        render_events_table(rows, width=1000)
+
+                if isinstance(q_hat, list) and not isinstance(q_dec, list):
+                    with st.expander("Q_hat", expanded=True):
+                        rows = [{"bit_index / symbol_index": i, "Q_hat": f"{float(v):.2f}"} for i, v in enumerate(q_hat)]
+                        render_events_table(rows, width=1000)
+                
+                if isinstance(phi_hat, list):
+                    with st.expander("phi_hat (estimated absolute phase per bit)", expanded=False):
+                        rows = [{"bit_index": i, "phi_hat (rad)": f"{float(v):.2f}"} for i, v in enumerate(phi_hat)]
+                        render_events_table(rows, width=1000)
+
+                if isinstance(delta_hat, list):
+                    with st.expander("delta_hat (estimated phase change per bit)", expanded=False):
+                        rows = [{"bit_index": i, "delta_hat (rad)": f"{float(v):.2f}"} for i, v in enumerate(delta_hat)]
+                        render_events_table(rows, width=1000)
+
+                if isinstance(warnings_list, list) and len(warnings_list) > 0:
+                    with st.expander("Warnings", expanded=True):
+                        wrows = [{"warning": w} for w in warnings_list]
+                        render_events_table(wrows, width=1000)
+
+                # 5) Existing event tables (if any)
+                for name, ev in event_lists.items():
+                    with st.expander(name, expanded=True):
+                        render_events_table(ev, width=1000)
+            else:
+                st.write(dem)
+            
+        with tab_details:
+            st.write("Input bits:")
+            st.code(bits_to_string(res.bits["input"]))
+
+            st.write("Decoded bits:")
+            st.code(bits_to_string(res.bits["decoded"]))
+
+            st.write("Match:")
+            if res.meta["match"]:
+                st.success("MATCH")
+            else:
+                st.error("MISMATCH")
+        
+        with tab_theory:
+            render_d2a_theory(
+                params=params,
+                show_grid=show_grid,
+                scheme_selected=scheme,
+                kwargs_selected=kwargs,
+            )
+
+
+elif mode == "Analog → Digital":
+    with st.sidebar:
+        st.subheader("Technique")
+        technique_label = st.selectbox(
+            "Digitization Technique",
+            ["PCM (Pulse Code Modulation)", "DM (Delta Modulation)"],
+            key="a2d_technique_label",
+        )
+
+        technique = "PCM" if technique_label.startswith("PCM") else "DM"
+
+
+        st.subheader("Message signal")
+        kind = st.selectbox("Waveform", ["sine", "square", "triangle"])
+        Am = st.slider("Amplitude", 0.1, 5.0, 1.0, step=0.1, key="a2d_Am")
+        fm = st.slider("Message frequency fm (Hz)", 1.0, 50.0, 5.0, step=1.0, key="a2d_fm")
+        duration = st.slider("Duration (s)", 0.5, 5.0, 2.0, step=0.5, key="a2d_duration")
+
+        st.subheader("Sampling (PAM)" if technique == "PCM" else "Sampling (DM)")
+        fs_mult = st.select_slider("Sampling multiplier (×fm)", options=[4, 8, 16, 32], value=8, key="a2d_fs_mult")
+
+        st.subheader("Technique parameters")
+        pcm_nbits = 4
+        dm_delta = 0.1
+        if technique == "PCM":
+            pcm_nbits = st.select_slider("PCM bits per sample", options=[2, 3, 4, 5, 6], value=4, key="a2d_pcm_nbits")
+        else:
+            dm_delta = st.slider("DM step size Δ", 0.01, 1.0, 0.1, step=0.01, key="a2d_dm_delta")
+
+        st.subheader("Line coding for produced bitstream")
+        linecode_scheme = st.selectbox("Line code", ["NRZ-L", "Manchester", "NRZI", "Bipolar-AMI"])
+
+        # --- Show defaults for selected line code (like D2D/D2A tables) ---
+        def _a2d_linecode_defaults_table(scheme: str, Ns: int):
+            Ns = int(Ns)
+            Ns_even = Ns if (Ns % 2 == 0) else (Ns + 1)
+
+            # Defaults (aligned with what you observed in D2D)
+            # NRZ-L: assumed previous level High (+A)
+            # NRZI: assumed previous level Low (-A)
+            # Manchester: assumed preceding bit = 1
+            # AMI: most recent preceding '1' polarity = Negative (-A)
+            if scheme == "NRZ-L":
+                rows = [
+                    {"Item": "Rule", "Default": "0 → +A, 1 → −A"},
+                    {"Item": "Assumed level BEFORE first bit", "Default": "High (+A)"},
+                ]
+
+            elif scheme == "NRZI":
+                rows = [
+                    {"Item": "Rule", "Default": "1 → transition; 0 → no transition"},
+                    {"Item": "Assumed level BEFORE first bit", "Default": "Low (-A)"},
+                ]
+
+            elif scheme == "Manchester":
+                rows = [
+                    {"Item": "Rule", "Default": "1: low→high, 0: high→low"},
+                    {"Item": "Assumed preceding bit", "Default": "1"},
+                ]
+
+            elif scheme == "Bipolar-AMI":
+                rows = [
+                    {"Item": "Rule", "Default": "0 → 0; 1 → alternates +A, −A"},
+                    {"Item": "Scrambling", "Default": "None"},
+                    {"Item": "Most recent preceding '1' polarity", "Default": "Negative (-A)"},
+                ]
+
+            else:
+                rows = [{"Item": "Defaults", "Default": "Not defined"}]
+
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df,
+                hide_index=True,
+                width="stretch",
+                column_config={
+            "Item": st.column_config.TextColumn("Item", width="medium"),
+            "Default": st.column_config.TextColumn("Default", width="medium"),
+        },
+    )
+
+        _a2d_linecode_defaults_table(linecode_scheme, params.samples_per_bit)
+
+        run = st.button("Run simulation", type="primary", key="a2d_run")
+
+    # --- A2D run state (live like D2D/D2A) ---
+    current_sig = make_signature(
+        "a2d", params,
+        technique=technique,
+        kind=kind,
+        Am=float(Am),
+        fm=float(fm),
+        duration=float(duration),
+        fs_mult=int(fs_mult),
+        pcm_nbits=int(pcm_nbits),
+        dm_delta=float(dm_delta),
+        linecode_scheme=str(linecode_scheme),
+    )
+
+    if "a2d_last" not in st.session_state:
+        st.session_state["a2d_last"] = None
+    if "a2d_sig" not in st.session_state:
+        st.session_state["a2d_sig"] = None
+
+    prev_sig = st.session_state.get("a2d_sig", None)
+
+    live = True
+    should_run = bool(run) or (live and (prev_sig is not None) and (prev_sig != current_sig))
+
+    if should_run:
+        res = simulate_a2d(
+            kind, technique, params,
+            Am=Am, fm=fm, duration=duration,
+            fs_mult=int(fs_mult),
+            pcm_nbits=int(pcm_nbits),
+            dm_delta=float(dm_delta),
+            linecode_scheme=linecode_scheme,
+        )
+        st.session_state["a2d_last"] = res
+        st.session_state["a2d_sig"] = current_sig
+
+    res = st.session_state.get("a2d_last", None)
+    if res is None:
+        empty_state()
+    else:
+        # Summary (use existing helper)
+        summ = res.meta.get("summary", {})
+        summary_block(summ)
+
+        tab_wave, tab_steps, tab_details, tab_theory = st.tabs(["Waveforms", "Steps", "Details", "Theory"])
+
+        with tab_wave:
+            x_dt = 0.5
+            tickvals = np.arange(0, duration + 1e-9, x_dt)
+            common_margin = dict(l=60, r=20, t=90, b=50)
+            # 1) analog message
+            figm = plot_signal(res.t, res.signals["m(t)"], "Message m(t)", grid=show_grid)
+            figm.update_xaxes(range=[0, duration], autorange=False)
+            figm.update_xaxes(tickmode="array", tickvals=tickvals)
+            figm.update_layout(margin=common_margin, showlegend=False)
+            st.plotly_chart(figm, width="stretch")
+
+            # 2) message + PAM samples
+            t_s = res.meta["sampled"]["t_s"]
+            m_s = res.meta["sampled"]["m_s"]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=res.t, y=res.signals["m(t)"], mode="lines", name="m(t)"))
+            samples_label = "PAM samples" if technique == "PCM" else "DM input samples"
+            samples_title = "PAM sampling (message with sampled points)" if technique == "PCM" else "Sampling for DM (message with sampled points)"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=t_s,
+                    y=m_s,
+                    mode="markers",
+                    name=samples_label,
+                    marker=dict(color="#FF4B4B", size=8),
+                )
+            )
+            fig.update_layout(title=samples_title, xaxis_title="Time (s)", yaxis_title="Amplitude")
+            fig.update_layout(
+                legend=dict(
+                    orientation="h",
+                    x=1.0, y=1.13,
+                    xanchor="right", yanchor="bottom",
+                    xref="paper", yref="paper",
+                    bgcolor="rgba(0,0,0,0)",
+                ),
+                margin=common_margin,
+            )
+            fig.update_xaxes(domain=[0, 1])
+            if show_grid:
+                fig.update_xaxes(showgrid=True)
+                fig.update_yaxes(showgrid=True)
+            fig.update_xaxes(range=[0, duration], autorange=False)
+            fig.update_xaxes(tickmode="array", tickvals=tickvals)
+            st.plotly_chart(fig, width="stretch")
+
+            # 3) Staircase (TX) + (RX)
+            stair_tx = res.meta.get("stair_tx", None)
+            stair_rx = res.meta.get("stair_rx", None)
+
+            if stair_tx is not None:
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(
+                    x=stair_tx["t_s"], y=stair_tx["x"],
+                    mode="lines",
+                    line_shape="hv",
+                    name="TX staircase",
+                    opacity=0.7,
+                ))
+                if stair_rx is not None:
+                    fig2.add_trace(go.Scatter(
+                        x=stair_rx["t_s"], y=stair_rx["x"],
+                        mode="lines",
+                        line_shape="hv",
+                        name="RX staircase",
+                        line=dict(color="#FF4B4B", dash="dash", width=2),
+                        opacity=0.9,
+                    ))
+                title = "PCM Quantized Staircase (TX vs RX)" if technique == "PCM" else "Delta Modulation Staircase (TX vs RX)"
+                fig2.update_layout(title=title, xaxis_title="Time (s)", yaxis_title="Amplitude")
+                fig2.update_layout(
+                    legend=dict(
+                        orientation="h",
+                        x=1.0, y=1.13,
+                        xanchor="right", yanchor="bottom",
+                        xref="paper", yref="paper",
+                        bgcolor="rgba(0,0,0,0)",
+                    ),
+                    margin=common_margin,
+                )
+                fig2.update_xaxes(domain=[0, 1])
+                if show_grid:
+                    fig2.update_xaxes(showgrid=True)
+                    fig2.update_yaxes(showgrid=True)
+                fig2.update_xaxes(range=[0, duration], autorange=False)
+                fig2.update_xaxes(tickmode="array", tickvals=tickvals)
+                st.plotly_chart(fig2, width="stretch")
+
+            # 4) Reconstructed signal on dense axis (ZOH)
+            figrtx = plot_signal(res.t, res.signals["recon_tx"], "Reconstructed (TX, ZOH on display axis)", grid=show_grid)
+            figrtx.update_xaxes(range=[0, duration], autorange=False)
+            figrtx.update_xaxes(tickmode="array", tickvals=tickvals)
+            figrtx.update_layout(margin=common_margin, showlegend=False)
+            st.plotly_chart(figrtx, width="stretch")
+            figrrx = plot_signal(res.t, res.signals["recon_rx"], "Reconstructed (RX, after line-decode + codec decode)", grid=show_grid)
+            figrrx.update_traces(line=dict(color="#FF4B4B"))
+            figrrx.update_xaxes(range=[0, duration], autorange=False)
+            figrrx.update_xaxes(tickmode="array", tickvals=tickvals)
+            figrrx.update_layout(margin=common_margin, showlegend=False)
+            st.plotly_chart(figrrx, width="stretch")
+
+            # 5) Line-coded waveform
+            t_bits = res.meta["t_bits"]
+            st.plotly_chart(
+                plot_signal(
+                    t_bits,
+                    res.signals["linecode"],
+                    f"Line-coded bitstream ({linecode_scheme})",
+                    grid=show_grid,
+                    x_dtick=params.Tb,
+                    y_dtick=1,
+                ),
+                width="stretch",
+            )
+
+            # 6) Show decoded bitstream as step (optional but useful)
+            dec_bits = res.bits.get("decoded_bitstream", [])
+            if isinstance(dec_bits, list) and len(dec_bits) > 0:
+                t_dec = np.arange(len(dec_bits) * Ns) / params.fs
+                x_dec = bits_to_step(dec_bits, Ns)
+                st.plotly_chart(
+                    plot_signal(t_dec, x_dec, "Decoded bitstream (0/1) after line decoding", grid=show_grid, step=True, x_dtick=params.Tb, y_dtick=1),
+                    width="stretch",
+                )
+
+        with tab_steps:
+            # Steps table (book-style)
+            if technique == "PCM":
+                pcm = res.meta.get("pcm", {})
+                steps = pcm.get("steps", [])
+
+                # --- PCM parameters (formatted) ---
+                def _fmt(x, spec: str) -> str:
+                    if x is None:
+                        return ""
+                    try:
+                        return format(float(x), spec)
+                    except Exception:
+                        return str(x)
+
+                pcm_params_display = {
+                    "n_bits": int(pcm.get("n_bits")) if pcm.get("n_bits") is not None else "",
+                    "L = 2^n": int(pcm.get("L")) if pcm.get("L") is not None else "",
+                    "Δ (quantization step)": _fmt(pcm.get("delta"), ".6g"),      # e.g., 0.125 or 1.25e-3
+                    "vmin": _fmt(pcm.get("vmin"), ".3f"),                      # e.g., -1.000
+                    "vmax": _fmt(pcm.get("vmax"), ".3f"),                      # e.g., +1.000
+                    "SNR est (dB) = 6.02n + 1.76": _fmt(pcm.get("snr_db_est"), ".2f"),
+                }
+
+                st.subheader("PCM parameters")
+                dict_to_pretty_table(pcm_params_display, width=700)
+
+                # --- PCM steps (PAM → Quantizer → Encoder) ---
+                with st.expander("PCM steps (PAM → Quantizer → Encoder)", expanded=False):
+                    if isinstance(steps, list) and len(steps) > 0:
+                        render_events_table(steps, width=1000)
+                    else:
+                        st.info("No PCM steps available.")
+
+            else:
+                dm = res.meta.get("dm", {})
+                steps = dm.get("steps", [])
+                sampler = res.meta.get("sampler", {})
+
+                def _fmt(x, spec: str) -> str:
+                    if x is None:
+                        return ""
+                    try:
+                        return format(float(x), spec)
+                    except Exception:
+                        return str(x)
+
+                dm_params_display = {
+                    "Δ (step size)": _fmt(dm.get("delta"), ".6g"),
+                    "Initial staircase estimate": _fmt(dm.get("est0"), ".3f"),
+                    "Sampling rate fs_samp (Hz)": _fmt(sampler.get("fs_samp"), ".3f"),
+                    "Sampling interval Ts (s)": _fmt(sampler.get("Ts"), ".6g"),
+                }
+
+                st.subheader("DM parameters")
+                dict_to_pretty_table(dm_params_display, width=700)
+
+                with st.expander("DM steps (Comparator → 1/0 → Staircase update ±Δ)", expanded=False):
+                    if isinstance(steps, list) and len(steps) > 0:
+                        render_events_table(steps, width=1000)
+                    else:
+                        st.info("No DM steps available.")
+
+        with tab_details:
+            bits_tx = res.bits.get("bitstream", [])
+            bits_rx = res.bits.get("decoded_bitstream", [])
+
+            s_tx = "".join("1" if b else "0" for b in bits_tx)
+            s_rx = "".join("1" if b else "0" for b in bits_rx)
+
+            st.write(f"TX bitstream length: {len(bits_tx)}")
+            st.code(s_tx[:500] + ("..." if len(s_tx) > 500 else ""))
+
+            st.write(f"Decoded bitstream length: {len(bits_rx)}")
+            st.code(s_rx[:500] + ("..." if len(s_rx) > 500 else ""))
+
+            st.write("Match (after line decode):")
+            if bool(res.meta.get("linecode", {}).get("match", False)):
+                st.success("MATCH")
+            else:
+                st.error("MISMATCH")
+        
+        with tab_theory:
+            render_a2d_theory(
+                res=res,
+                params=params,
+                show_grid=show_grid,
+                technique=technique,
+                kind=kind,
+                Am=float(Am),
+                fm=float(fm),
+                duration=float(duration),
+                fs_mult=int(fs_mult),
+                pcm_nbits=int(pcm_nbits),
+                dm_delta=float(dm_delta),
+                linecode_scheme=str(linecode_scheme),
+            )
+
+
+elif mode == "Analog → Analog":
+    with st.sidebar:
+        st.subheader("Technique")
+        scheme_label = st.selectbox(
+            "Modulation",
+            ["AM (Amplitude Modulation)", "FM (Frequency Modulation)", "PM (Phase Modulation)"],
+            key="a2a_scheme_label",
+        )
+        scheme = scheme_label.split()[0]  # "AM" / "FM" / "PM"
+
+        st.subheader("Message signal")
+        kind = st.selectbox("Waveform", ["sine", "triangle"], key="a2a_kind")
+        Am = st.slider("Amplitude", 0.1, 5.0, 1.0, step=0.1, key="a2a_Am")
+        fm = st.slider("Message frequency fm (Hz)", 1.0, 50.0, 5.0, step=1.0, key="a2a_fm")
+        duration = st.slider("Duration (s)", 0.5, 5.0, 2.0, step=0.5, key="a2a_duration")
+
+        st.subheader("Carrier/sampling")
+        fs_a = st.select_slider(
+            "Sampling rate fs (Hz)",
+            options=[2000, 5000, 10000, 20000],
+            value=10000,
+            key="a2a_fs",
+        )
+        fc_ratio = st.slider("Carrier ratio fc/fm", 5, 50, 20, key="a2a_fc_ratio")
+        fc_a = float(fc_ratio) * float(fm)
+        invalid_carrier = (fc_a >= 0.5 * fs_a)
+        if invalid_carrier:
+            st.error("Invalid settings: carrier fc must be < fs/2 to avoid aliasing. Increase fs or reduce fc/fm.")
+        Ac_a = st.number_input("Carrier amplitude Ac", min_value=0.1, value=1.0, step=0.1, key="a2a_Ac")
+
+        st.subheader("Modulation parameter")
+
+        na = 0.5
+        nf = 2 * np.pi * 5.0   # rad/s per unit amplitude
+        np_ = 1.0              # rad per unit amplitude
+
+        if scheme == "AM":
+            na = st.slider("n_a (modulation index)", 0.05, 1.5, 0.5, step=0.05, key="a2a_na")
+
+        elif scheme == "FM":
+            nf = st.slider(
+                "n_f (rad/s per unit amplitude)",
+                20.0, 400.0, float(2 * np.pi * 5.0),
+                step=0.5,
+                key="a2a_nf",
+            )
+            if nf < 20:
+                st.warning("Small n_f means weak FM; phase/inst-frequency edge artifacts get amplified by 1/n_f.")
+            st.caption("φ'(t) = n_f m(t)  ⇒  ΔF = (n_f A_m)/(2π)")
+
+        else:  # PM
+            np_ = st.slider(
+                "n_p (rad per unit amplitude)",
+                0.1, 10.0, 1.0,
+                step=0.1,
+                key="a2a_np",
+            )
+            st.caption("φ(t) = n_p m(t)  ⇒  Δφ_max = n_p A_m")
+        
+        # Extra aliasing sanity checks for angle modulation (beyond fc < fs/2)
+        if scheme == "FM":
+            delta_f_max = abs(float(nf)) * float(Am) / (2 * np.pi)
+            if (fc_a + delta_f_max) >= 0.5 * fs_a:
+                st.error("Invalid: fc + ΔF must be < fs/2 (FM would alias). Increase fs or reduce n_f / Am / fc.")
+                invalid_carrier = True
+
+        if scheme == "PM":
+            delta_f_max = abs(float(np_)) * float(Am) * float(fm)  # single-tone approx
+            if (fc_a + delta_f_max) >= 0.5 * fs_a:
+                st.error("Invalid: fc + ΔF must be < fs/2 (PM would alias). Increase fs or reduce n_p / Am / fm / fc.")
+                invalid_carrier = True
+
+        run = st.button("Run simulation", type="primary", key="a2a_run", disabled=invalid_carrier)
+
+    # Build SimParams for A2A
+    aparams = SimParams(fs=float(fs_a), Tb=1.0, samples_per_bit=20, Ac=float(Ac_a), fc=float(fc_a))
+
+    # Signature-based run control (no auto-run on first entry, live-update after first run)
+    current_sig = make_signature(
+        "a2a",
+        aparams,
+        scheme=str(scheme),
+        kind=str(kind),
+        Am=float(Am),
+        fm=float(fm),
+        duration=float(duration),
+        na=float(na),
+        nf=float(nf),
+        np_=float(np_),
+    )
+
+    if "a2a_last" not in st.session_state:
+        st.session_state["a2a_last"] = None
+    if "a2a_sig" not in st.session_state:
+        st.session_state["a2a_sig"] = None
+
+    prev_sig = st.session_state.get("a2a_sig", None)
+    should_run = bool(run) or ((prev_sig is not None) and (prev_sig != current_sig))
+
+    if should_run:
+        try:
+            res = simulate_a2a(
+                kind,
+                scheme,
+                aparams,
+                Am=float(Am),
+                fm=float(fm),
+                duration=float(duration),
+                na=float(na),
+                nf=float(nf),
+                np_=float(np_),
+            )
+        except Exception as e:
+            st.error(f"Simulation error: {e}")
+            st.stop()
+
+        st.session_state["a2a_last"] = res
+        st.session_state["a2a_sig"] = current_sig
+
+    res = st.session_state.get("a2a_last", None)
+    if res is None:
+        empty_state()
+        st.stop()
+
+    # ---- Summary (use the same nice rows as the old expander) ----
+    st.subheader("Summary")
+
+    rows = {
+        "Scheme": scheme,
+        "Message waveform": str(kind),
+        "Am (message amplitude)": float(Am),
+        "fm (Hz)": float(fm),
+        "Duration (s)": float(duration),
+        "fs (Hz)": float(fs_a),
+        "fc (Hz)": float(fc_a),
+        "Ac (carrier amplitude)": float(Ac_a),
+    }
+
+    if scheme == "AM":
+        am = res.meta.get("am", {})
+        rows.update({
+            "n_a": float(am.get("na", na)),
+            "Modulation index μ (book) = |n_a| (since max|x|=1)": float(am.get("modulation_index_mu", np.nan)),
+            "Bandwidth hint (DSB-LC) ≈ 2·fm (Hz)": float(am.get("bandwidth_hint_hz", np.nan)),
+        })
+
+    elif scheme == "FM":
+        fm_meta = res.meta.get("fm", {})
+        rows.update({
+            "n_f (rad/s per unit)": float(fm_meta.get("nf_rad_per_s_per_unit", nf)),
+            "Max freq deviation ΔF (Hz) = (n_f A_m)/(2π)": float(fm_meta.get("delta_f_max_hz", np.nan)),
+            "FM index β = ΔF/fm": float(fm_meta.get("beta_index", np.nan)),
+            "Carson BW ≈ 2(ΔF + fm) (Hz)": float(fm_meta.get("bw_carson_hz", np.nan)),
+        })
+
+    else:  # PM
+        pm = res.meta.get("pm", {})
+        rows.update({
+            "n_p (rad per unit)": float(pm.get("np_rad_per_unit", np_)),
+            "Max phase dev Δφ (rad) = n_p A_m": float(pm.get("delta_phi_max_rad", np.nan)),
+            "Max freq dev ΔF (Hz, single-tone approx) ≈ n_p A_m f_m": float(pm.get("delta_f_max_hz_sine_approx", np.nan)),
+            "Carson BW ≈ 2(ΔF + fm) (Hz)": float(pm.get("bw_carson_hz_sine_approx", np.nan)),
+        })
+
+    # Formatting (same idea you used before)
+    a2a_pretty_fmt = {
+        "Am (message amplitude)": ".2f",
+        "fm (Hz)": ".2f",
+        "Duration (s)": ".2f",
+        "fs (Hz)": ".0f",
+        "fc (Hz)": ".2f",
+        "Ac (carrier amplitude)": ".2f",
+        "n_a": ".2f",
+        "Modulation index μ (book) = |n_a| (since max|x|=1)": ".2f",
+        "Bandwidth hint (DSB-LC) ≈ 2·fm (Hz)": ".0f",
+        "n_f (rad/s per unit)": ".2f",
+        "Max freq deviation ΔF (Hz) = (n_f A_m)/(2π)": ".2f",
+        "FM index β = ΔF/fm": ".3f",
+        "Carson BW ≈ 2(ΔF + fm) (Hz)": ".0f",
+        "n_p (rad per unit)": ".2f",
+        "Max phase dev Δφ (rad) = n_p A_m": ".3f",
+        "Max freq dev ΔF (Hz, single-tone approx) ≈ n_p A_m f_m": ".2f",
+    }
+
+    dict_to_pretty_table(rows, width=700, float_formats=a2a_pretty_fmt, default_float_fmt=".6g")
+
+
+    # Shared X-axis formatting (align plots vertically like in A2D)
+    tickvals = list(np.arange(0.0, float(duration) + 1e-9, 0.5))
+    if (len(tickvals) == 0) or (abs(tickvals[-1] - float(duration)) > 1e-9):
+        tickvals.append(float(duration))
+
+    common_margin = dict(t=90, r=20, l=20, b=40)
+    legend_above = dict(
+        orientation="h",
+        x=1.0,
+        y=1.13,
+        xanchor="right",
+        yanchor="bottom",
+        xref="paper",
+        yref="paper",
+        bgcolor="rgba(0,0,0,0)",
+    )
+
+    tab_wave, tab_steps, tab_details, tab_theory = st.tabs(["Waveforms", "Steps", "Details", "Theory"])
+
+    with tab_wave:
+        # 1) Message
+        figm = go.Figure()
+        figm.add_trace(go.Scatter(x=res.t, y=res.signals["m(t)"], mode="lines", name="m(t)"))
+        figm.update_layout(title="Message m(t)", xaxis_title="Time (s)", yaxis_title="Amplitude", showlegend=False, margin=common_margin)
+        figm.update_xaxes(range=[0, duration], autorange=False, tickmode="array", tickvals=tickvals)
+        figm.update_xaxes(domain=[0, 1])
+        if show_grid:
+            figm.update_xaxes(showgrid=True)
+            figm.update_yaxes(showgrid=True)
+        st.plotly_chart(figm, width="stretch")
+
+        # 2) Modulated signal (and envelope for AM)
+        figtx = go.Figure()
+        figtx.add_trace(go.Scatter(x=res.t, y=res.signals["tx"], mode="lines", name="s(t) (TX)"))
+
+        if scheme == "AM" and ("envelope_theory" in res.signals):
+            env = res.signals["envelope_theory"]
+            figtx.add_trace(
+                go.Scatter(
+                    x=res.t, y=env,
+                    mode="lines",
+                    name="+Envelope (theory)",
+                    line=dict(dash="dash", color="#C9FF05", width=2),
+                    opacity=0.90,
+                )
+            )
+            figtx.add_trace(
+                go.Scatter(
+                    x=res.t, y=-env,
+                    mode="lines",
+                    name="-Envelope (theory)",
+                    line=dict(dash="dash", color="#AA00FF", width=2),
+                    opacity=0.90,
+                )
+            )
+
+        figtx.update_layout(
+            title=f"Modulated signal s(t) ({scheme})",
+            xaxis_title="Time (s)",
+            yaxis_title="Amplitude",
+            legend=legend_above,
+            margin=common_margin,
+        )
+        figtx.update_xaxes(range=[0, duration], autorange=False, tickmode="array", tickvals=tickvals)
+        figtx.update_xaxes(domain=[0, 1])
+        if show_grid:
+            figtx.update_xaxes(showgrid=True)
+            figtx.update_yaxes(showgrid=True)
+        st.plotly_chart(figtx, width="stretch")
+
+        # 3) Recovered vs original (overlay)
+        figr = go.Figure()
+
+        # Draw RX first (so original can sit "above" it)
+        figr.add_trace(
+            go.Scatter(
+                x=res.t,
+                y=res.signals["recovered"],
+                mode="lines",
+                name="Recovered (RX)",
+                line=dict(color="#ff4b4b", width=2),
+                opacity=0.95,
+            )
+        )
+
+        # Draw original dashed on top with opacity
+        figr.add_trace(
+            go.Scatter(
+                x=res.t,
+                y=res.signals["m(t)"],
+                mode="lines",
+                name="m(t) (original)",
+                line=dict(dash="dash", width=2),
+                opacity=0.75,
+            )
+        )
+        figr.update_layout(
+            title="Recovered message (overlay)",
+            xaxis_title="Time (s)",
+            yaxis_title="Amplitude",
+            legend=legend_above,
+            margin=common_margin,
+        )
+        figr.update_xaxes(range=[0, duration], autorange=False, tickmode="array", tickvals=tickvals)
+        figr.update_xaxes(domain=[0, 1])
+        if show_grid:
+            figr.update_xaxes(showgrid=True)
+            figr.update_yaxes(showgrid=True)
+        st.plotly_chart(figr, width="stretch")
+
+    with tab_steps:
+        # Formatting helpers for compact, readable tables
+        def _fmt(x: float, nd: int = 3) -> str:
+            try:
+                xf = float(x)
+            except Exception:
+                return str(x)
+            if abs(xf) >= 1000:
+                return f"{xf:.0f}"
+            if abs(xf) >= 100:
+                return f"{xf:.1f}"
+            if abs(xf) >= 10:
+                return f"{xf:.2f}"
+            return f"{xf:.{nd}f}".rstrip("0").rstrip(".")
+
+        # Scheme warnings: AM overmodulation when μ>1
+        if scheme == "AM":
+            mu = float(res.meta.get("am", {}).get("modulation_index_mu", 0.0))
+            if mu > 1.0:
+                st.warning(f"AM overmodulation detected (μ = {mu:.2f} > 1). Envelope will cross zero and envelope detection distorts.")
+            if na <= 0.10:
+                st.warning(f"Low modulation index (n_a = {na:.2f} ≤ 0.1) may lead to poor recovery due to low envelope SNR. As it makes envelope-based recovery numerically sensitive; tiny residual edge effects can be amplified.")
+
+        # Steps table
+        steps = [
+            {"Stage": "1) Message", "Description": "Generate analog message m(t) from chosen waveform (sine/triangle)."},
+            {"Stage": "2) Carrier", "Description": "Generate carrier c(t)=sin(2π f_c t)."},
+        ]
+        if scheme == "AM":
+            steps.append({"Stage": "3) AM modulator", "Description": "Book (DSBTC): s(t) = A_c[1 + n_a x(t)]sin(2πf_ct), with x(t)=m(t)/max|m(t)|."})
+            steps.append({"Stage": "4) (Ideal) AM demod", "Description": "Envelope estimate via analytic signal; x̂(t) ≈ (env/A_c − 1)/n_a, then m̂(t)=x̂·max|m(t)|."})
+        elif scheme == "FM":
+            steps.append({"Stage": "3) FM modulator", "Description": "Angle modulation: s(t)=A_c sin(2πf_ct + φ(t)), with φ'(t)=n_f m(t) (Stallings 16.4) ⇒ φ(t)=∫ n_f m(τ)dτ."})
+            steps.append({"Stage": "4) (Ideal) FM demod", "Description": "f_i(t)=(1/2π)d/dt[2πf_ct+φ(t)] ⇒ m̂(t)=(2π/n_f)(f_i(t)−f_c)."})
+        else:
+            steps.append({"Stage": "3) PM modulator", "Description": "Angle modulation: s(t)=A_c sin(2πf_ct + φ(t)), with φ(t)=n_p m(t) (Stallings 16.3)."})
+            steps.append({"Stage": "4) (Ideal) PM demod", "Description": "Extract phase deviation: φ_dev(t)=phase−2πf_ct ⇒ m̂(t)=φ_dev(t)/n_p."})
+
+        dfs = pd.DataFrame(steps)
+        st.dataframe(
+            dfs,
+            hide_index=True,
+            width=1000,
+            column_config={
+                "Stage": st.column_config.TextColumn("Stage", width="medium"),
+                "Description": st.column_config.TextColumn("Description", width="large"),
+            },
+        )
+        
+        # ---- Debug at end ----
+        with st.expander("Full metadata (debug)", expanded=False):
+            st.json(res.meta)
+
+    with tab_details:
+        m0 = np.asarray(res.signals.get("m(t)", []), dtype=float)
+        mr = np.asarray(res.signals.get("recovered", []), dtype=float)
+
+        n = int(min(m0.size, mr.size))
+        if n == 0:
+            st.info("No signals to compare.")
+            st.stop()
+
+        m0 = m0[:n]
+        mr = mr[:n]
+
+        # Match check must analyze exactly what is shown in Waveforms.
+        # Since simulate_a2a already does pad→demod→crop, we do NOT crop again here.
+        guard = 0
+        m0c = m0
+        mrc = mr
+
+        # Remove DC bias before scoring (helps especially for small n_a)
+        m0c = m0c - float(np.mean(m0c))
+        mrc = mrc - float(np.mean(mrc))
+
+        err = mrc - m0c
+        mse = float(np.mean(err ** 2))
+        rmse = float(np.sqrt(mse))
+        peak = float(np.max(np.abs(m0c))) if np.max(np.abs(m0c)) > 0 else 1.0
+        nrmse = float(rmse / peak)
+
+        # correlation (guard against constant signals)
+        if np.std(m0c) < 1e-12 or np.std(mrc) < 1e-12:
+            corr = float("nan")
+        else:
+            corr = float(np.corrcoef(m0c, mrc)[0, 1])
+
+        # practical match rule for visualization correctness
+        match = (nrmse < 0.05) and (np.isfinite(corr) and corr > 0.99)
+
+        st.subheader("Input vs output check")
+        if match:
+            st.success("MATCH (recovered ≈ original)")
+        else:
+            st.error("MISMATCH (recovered deviates from original)")
+
+        metrics = {
+            "Samples compared": int(m0c.size),
+            "Edge guard (samples each side)": int(guard),
+            "RMSE": rmse,
+            "NRMSE (RMSE / peak|m|)": nrmse,
+            "Correlation": corr,
+            "Original peak |m(t)|": peak,
+            "Max abs error": float(np.max(np.abs(err))),
+            "Mean error": float(np.mean(err)),
+        }
+        dict_to_pretty_table(metrics, width=700, default_float_fmt=".6g")
+    
+    with tab_theory:
+        render_a2a_theory(
+            params=aparams,
+            show_grid=show_grid,
+            scheme_selected=scheme,
+            kind_selected=kind,
+            Am=float(Am),
+            fm=float(fm),
+            duration=float(duration),
+            na=float(na),
+            nf=float(nf),
+            np_=float(np_),
+            res=res,
+        )
